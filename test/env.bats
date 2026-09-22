@@ -294,6 +294,40 @@ bin/dap --wait-for-master' ]
 }
 
 #
+## Provisioning
+#
+
+@test "every planned command runs, even when one of them drains stdin" {
+  BIN_ENV_SOURCE_ONLY=1 source bin/env
+
+  # bin/dap reaches the appliance through `docker compose exec -T`, which
+  # forwards stdin. A command like that, run inside the loop that reads the
+  # command list, consumes the steps after it -- and the loop then ends
+  # normally, so provisioning reports success having done a third of the work.
+  #
+  # `wc -c` stands in for it: it drains stdin just as thoroughly, but reports
+  # only a byte count, so it cannot echo the later steps back and make this pass
+  # by accident the way `cat` would.
+  _provision_commands() {
+    echo 'wc -c'
+    echo 'echo second-command-ran'
+    echo 'echo third-command-ran'
+  }
+
+  # /dev/null so the stand-in sees EOF rather than blocking. The loop under test
+  # supplies its own stdin, so this does not mask the bug being guarded against.
+  run _provision < /dev/null
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'second-command-ran'* ]]
+  [[ "$output" == *'third-command-ran'* ]]
+
+  # Announced three steps, so it really attempted three rather than reporting
+  # success after the first.
+  [ "$(printf '%s\n' "$output" | grep -c '^==> ')" -eq 3 ]
+}
+
+#
 ## Verification
 #
 # Only the failure side can be checked without a real appliance: with nothing

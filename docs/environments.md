@@ -148,9 +148,26 @@ hand-wrote fails in exactly the same place as one a tool generated for you.
 ## Reading the verification table
 
 After provisioning, `bin/env` probes the environment and compares what it finds
-against what you asked for. Any mismatch exits non-zero. Here is the table
-against a stopped environment, which is what every failure mode looks like at
-once:
+against what you asked for. Any mismatch exits non-zero. A successful run:
+
+```
+Verification
+
+  DIMENSION            DESIRED          ACTUAL           RESULT
+  leader health        ok               ok               ok
+  leader /info         reported         reported         ok
+  leader image tag     5.0-stable       5.0-stable       ok
+  standbys running     0                0                ok
+  followers running    0                0                ok
+  auto-failover        false            false            ok
+  sample data          loaded           loaded           ok
+
+The environment matches the spec.
+Conjur is available at: 'https://localhost:443'
+```
+
+And the same table against a stopped environment, which is what every failure
+mode looks like at once:
 
 ```
 Verification
@@ -244,6 +261,14 @@ before assuming you need the network.
 **Verification mismatches immediately after a successful-looking run.** Most
 often a stale container from an earlier version, which the image-tag row is there
 to catch. `bin/dap --stop` and rebuild.
+
+**Alarming-looking errors partway through provisioning.** Lines like
+`nginx: [emerg] cannot load certificate … no such file` followed by
+`WARN: command nginx -t failed` are the appliance's own bootstrap noise — the
+certificate genuinely does not exist at that point in `evoke configure master`,
+and it is generated a few steps later. They come from the appliance, not from
+`bin/env`, and a run that ends with `Configuration successful` was fine. Trust
+the verification table over anything in the middle.
 
 **A spec validates but provisioning fails.** That gap is the interesting one —
 the schema is meant to make it impossible. Worth reporting rather than working

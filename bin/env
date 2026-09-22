@@ -182,10 +182,20 @@ function _print_plan {
 #
 
 function _provision {
+  local commands=()
   local command
   local argv
 
+  # Read the whole sequence before running any of it. Running a command inside
+  # the `while read` loop that produced it hands that command the loop's own
+  # stdin, and anything which drains stdin then eats the steps that follow --
+  # bin/dap does exactly this, via `docker compose exec -T`, so provisioning
+  # stopped after the first command and still exited 0.
   while IFS= read -r command; do
+    commands+=("$command")
+  done < <(_provision_commands)
+
+  for command in "${commands[@]}"; do
     echo
     echo "==> $command"
 
@@ -194,7 +204,7 @@ function _provision {
     # a spec should ever be able to turn into shell syntax.
     IFS=' ' read -r -a argv <<< "$command"
     "${argv[@]}"
-  done < <(_provision_commands)
+  done
 }
 
 #
