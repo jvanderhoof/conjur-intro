@@ -49,3 +49,13 @@ tools/performance-tests/k6/data/policy/secrets
 tools/performance-tests/k6/data/policy/authenticators
 
 key.txt
+
+# Local planning and scratch work
+.scratch/
+
+# Declarative environment specs. Real specs hold appliance hostnames and admin
+# passwords copied out of customer tickets, and this repo is mirrored to the
+# public conjurdemos GitHub org (see Jenkinsfile), so only the schema and the
+# sanitized examples under environments/examples/ are tracked.
+environments/*.yml
+environments/*.yaml

@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/conjurdemos/conjur-intro/environments/schema.json",
+  "title": "conjur-intro declarative environment",
+  "description": "Describes the end state of a Conjur environment so it can be provisioned reproducibly. This is the contract for bin/env: an unsupported or misspelled key is a hard error rather than a silent no-op. See docs/declarative-environments.md.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version"],
+  "properties": {
+    "version": {
+      "description": "Appliance image tag to provision, as passed to `bin/dap --version`. Must be a quoted string: unquoted `13.5` is a YAML number, and unquoted `13.10` would silently become 13.1.",
+      "type": "string",
+      "minLength": 1
+    },
+    "leader": {
+      "description": "The leader and its standby cluster.",
+      "type": "object",
+      "additionalProperties": false,
+      "default": {},
+      "properties": {
+        "standbys": {
+          "description": "Number of standbys to deploy alongside the leader. docker-compose.yml defines conjur-master-2 through conjur-master-5, so 4 is the ceiling.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4,
+          "default": 0
+        },
+        "auto_failover": {
+          "description": "Enrol the leader and its standbys in an auto-failover cluster. Requires at least 2 standbys, because a cluster needs a quorum to promote.",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "type": "object",
+            "properties": { "auto_failover": { "const": true } },
+            "required": ["auto_failover"]
+          },
+          "then": {
+            "properties": { "standbys": { "minimum": 2 } },
+            "required": ["standbys"]
+          }
+        }
+      ]
+    },
+    "followers": {
+      "description": "Number of followers to deploy behind the follower load balancer. Multi-follower support needs new compose services and generated haproxy backends, so 1 is the ceiling for now.",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 1,
+      "default": 0
+    },
+    "sample_data": {
+      "description": "Load the sample policy and variable values. Defaults to true: with no policy and no secrets there is nothing to reproduce a secret-retrieval issue against.",
+      "type": "boolean",
+      "default": true
+    },
+    "events": {
+      "description": "RESERVED SEAM -- NOT IMPLEMENTED. A large share of real escalations are about transitions (an upgrade, a promotion, a triggered failover) rather than an end state, and bin/dap already models those as discrete actions. Reserving the key now means adding them later is an extension rather than a breaking redesign. Only an empty list validates today; see docs/declarative-environments.md.",
+      "type": "array",
+      "maxItems": 0
+    }
+  }
+}

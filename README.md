@@ -152,10 +152,60 @@ To connect to the UI in the browser, use ports 10443(through HA proxy) or 10444(
 |--authenticate-user|action|• Authenticates with default user and password<br>• Displays the resulting authentication token||
 |--fetch-secrets|action|• Authenticates<br>• Retrieves variable values|Run against follower unless `--against-master` flag is present|
 |--load-policy|action|• Authenticates<br>• Loads policy|Run against master|
-|--load-policy-and-values|action|• Authenticates<br>• Loads policy and variable values|Run against master, equivalent to running '--load-policy' and '--set-secrets'|
+|--load-sample-policy-and-values|action|• Authenticates<br>• Loads policy and variable values|Run against master, equivalent to running '--load-sample-policy' and '--set-secrets'|
 |--password `<password>`|configuration|Uses a non-default password for authentication||
 |--set-secrets|action|• Authenticates<br>• Sets variable values|Requires `--load-policy` before running|
 |--user `<conjur-user>`|configuration|Uses a non-default (`admin`) user for authentication||
+
+### bin/env
+
+`bin/env` provisions an environment from a declarative spec, so that a
+configuration can be described once, built reproducibly, and rebuilt later —
+typically to reproduce a customer issue locally. Where `bin/dap` is a set of
+lifecycle verbs, `bin/env` is a single description of the end state you want.
+
+```sh
+# Show the commands and checks without running any of them
+$ bin/env --plan environments/examples/single-node.yml
+
+# Provision, then print a desired-vs-actual table
+$ bin/env environments/examples/single-node.yml
+```
+
+A spec is YAML, validated against [`environments/schema.json`](environments/schema.json).
+The smallest useful one is a single line:
+
+```yaml
+version: "5.0-stable"
+```
+
+Everything else takes a documented default: one leader, no standbys, no
+followers, no auto-failover, and the sample policy and secrets loaded. Quote the
+version — unquoted `13.10` is the YAML number `13.1`.
+
+The schema is the contract, so an unknown or misspelled key is a hard error
+naming the offending field rather than a silent no-op:
+
+```
+$ bin/env --plan my-spec.yml
+bin/env: spec error at /leader/standby: unknown key; the schema does not define it
+bin/env: the spec was not accepted, so nothing was provisioned.
+```
+
+Specs written into `environments/` are gitignored, because this repo is mirrored
+to the public `conjurdemos` GitHub org and real specs carry customer hostnames
+and admin passwords. Only the schema and the sanitized examples under
+`environments/examples/` are tracked.
+
+Multiple standbys, auto-failover and followers are described by the schema but
+are not provisioned yet — `bin/env` says so and provisions nothing, rather than
+quietly building something smaller than you asked for. Use `bin/dap` for those
+until they land.
+
+Run the fast tests with `bin/env-test`. They take about nine seconds and need no
+appliance containers and no `registry.tld` access. See
+[docs/declarative-environments.md](docs/declarative-environments.md) for the
+design, the decision log, and what is deliberately out of scope.
 
 ## Start a single DAP instance
 

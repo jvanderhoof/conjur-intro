@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""Convert a declarative environment spec to JSON and validate it.
+
+The spec arrives on stdin as YAML. The schema is mounted at /schema.json. On
+success the resolved spec -- the spec with every schema default filled in -- is
+written to stdout as JSON, which is what bin/env reads with jq. On failure every
+problem is written to stderr as a JSON pointer plus a message, and the exit
+status is non-zero so nothing gets provisioned.
+
+Conversion and validation live in the same pass on purpose: a spec that bin/env
+can read is by construction a spec the schema has accepted.
+"""
+
+import copy
+import json
+import sys
+
+import yaml
+from jsonschema import Draft202012Validator
+
+SCHEMA_PATH = "/schema.json"
+
+# Validation failure. Distinct from 1 so an unexpected crash in here is not
+# mistaken for a rejected spec.
+EXIT_INVALID = 2
+
+
+def with_defaults(instance, schema):
+    """Fill in schema defaults so bin/env always reads a complete document.
+
+    Only object properties are walked, which is all this schema needs.
+
+    Defaults exist so a hand-written spec containing nothing but `version:` is
+    usable. The conjur-env skill deliberately does not rely on them -- it asks
+    about every unstated dimension instead -- so these two must stay consistent
+    as fields are added, or a hand-written spec and a generated one will behave
+    differently. See the known-debt note in docs/declarative-environments.md.
+    """
+    if instance is None and "default" in schema:
+        instance = copy.deepcopy(schema["default"])
+
+    properties = schema.get("properties")
+    if not properties or not isinstance(instance, dict):
+        return instance
+
+    for key, subschema in properties.items():
+        if key in instance:
+            instance[key] = with_defaults(instance[key], subschema)
+        elif "default" in subschema:
+            instance[key] = with_defaults(copy.deepcopy(subschema["default"]), subschema)
+
+    return instance
+
+
+def problems(validator, document):
+    """Every schema violation, as sorted (pointer, message) pairs."""
+    found = set()
+
+    for error in validator.iter_errors(document):
+        path = [str(part) for part in error.absolute_path]
+
+        # jsonschema reports an unexpected key against the object that contains
+        # it, which makes a typo in a nested field hard to place. Name the
+        # offending key itself instead.
+        if error.validator == "additionalProperties" and isinstance(error.instance, dict):
+            allowed = set(error.schema.get("properties", {}))
+            extras = sorted(set(error.instance) - allowed)
+            if extras:
+                for extra in extras:
+                    found.add((
+                        "/" + "/".join(path + [extra]),
+                        "unknown key; the schema does not define it",
+                    ))
+                continue
+
+        found.add(("/" + "/".join(path), error.message))
+
+    return sorted(found)
+
+
+def hint_for(pointer, message):
+    """Extra guidance for mistakes the schema can detect but not explain."""
+    if pointer == "/version" and "is not of type 'string'" in message:
+        return 'quote the version so YAML keeps it a string, e.g. version: "13.5"'
+
+    if pointer == "/events":
+        return (
+            "event sequences (upgrades, promotions, triggered failovers) are a "
+            "reserved seam and are not implemented; run them by hand with "
+            "bin/dap and see docs/declarative-environments.md"
+        )
+
+    if pointer == "/leader/standbys" and "minimum of 2" in message:
+        return "auto_failover needs a quorum, so it requires at least 2 standbys"
+
+    return None
+
+
+def reject(*messages):
+    for message in messages:
+        print(f"bin/env: {message}", file=sys.stderr)
+    sys.exit(EXIT_INVALID)
+
+
+def main():
+    with open(SCHEMA_PATH, encoding="utf-8") as handle:
+        schema = json.load(handle)
+
+    try:
+        document = yaml.safe_load(sys.stdin.read())
+    except yaml.YAMLError as error:
+        reject(f"spec is not valid YAML: {error}")
+
+    if document is None:
+        reject("spec is empty")
+
+    document = with_defaults(document, schema)
+
+    found = problems(Draft202012Validator(schema), document)
+    if found:
+        lines = []
+        for pointer, message in found:
+            lines.append(f"spec error at {pointer}: {message}")
+            hint = hint_for(pointer, message)
+            if hint:
+                lines.append(f"  hint: {hint}")
+        reject(*lines)
+
+    json.dump(document, sys.stdout)
+
+
+if __name__ == "__main__":
+    main()

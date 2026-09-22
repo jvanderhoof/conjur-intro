@@ -1,0 +1,434 @@
+#!/usr/bin/env bash
+
+# Provisions a Conjur environment from a declarative spec, then checks that what
+# came up is what was asked for.
+#
+# The ordering knowledge lives here rather than in a skill's prose because it is
+# deterministic and testable: see test/env.bats, and
+# docs/declarative-environments.md for the design and its known debt.
+
+set -euo pipefail
+
+# A spec path is resolved against wherever the user ran this from, not the repo
+# root we are about to move to.
+CALLER_PWD="$PWD"
+
+# Always work from repo root directory. BASH_SOURCE rather than $0 so that
+# test/env.bats can source this file to reach the verification helpers.
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+source ./bin/utils.sh
+
+# Make sure .env envvars are available
+dotenv > /dev/null 2>&1 || true
+
+CONJUR_MASTER_PORT="${CONJUR_MASTER_PORT:-443}"
+
+# Holds the YAML parser and the JSON Schema validator so that neither is a host
+# dependency. Bump the tag when artifacts/env-validator changes.
+VALIDATOR_IMAGE='conjur-intro/env-validator:1'
+SCHEMA='environments/schema.json'
+
+# One of the variables `bin/api --load-sample-policy-and-values` sets. Verifying
+# that this reads back is the difference between "the appliance is up" and "the
+# appliance is usable for a repro".
+SAMPLE_SECRET='staging/my-app-1/postgres-database/password'
+SAMPLE_SECRET_VALUE='secret-p@ssword-staging-my-app-1'
+
+function _print_help {
+  cat << EOF
+
+Provisions a Conjur environment from a declarative spec.
+
+Synopsis: bin/env [options] <spec>
+
+Usage: bin/env [options] <spec>:
+
+    --plan          Print the ordered command sequence and the checks that would
+                      follow it, then exit without provisioning anything.
+
+    -h, --help      Shows this help message.
+
+The spec is a YAML file validated against $SCHEMA; an unknown or
+misspelled key is a hard error. Start from
+environments/examples/single-node.yml.
+
+Specs written directly into environments/ are gitignored. This repo is mirrored
+to the public conjurdemos GitHub org, so customer hostnames and admin passwords
+must never end up in a tracked file.
+
+Multiple standbys, auto-failover and followers are described by the schema but
+are not provisioned yet; bin/env says so rather than quietly building something
+smaller. Set them up with bin/dap by hand until then.
+
+See docs/declarative-environments.md.
+
+EOF
+  exit
+}
+
+#
+## Spec handling
+#
+
+function _spec_path {
+  local given="$1"
+
+  if [[ "$given" = /* ]]; then
+    echo "$given"
+  elif [[ -f "$CALLER_PWD/$given" ]]; then
+    echo "$CALLER_PWD/$given"
+  else
+    echo "$given"
+  fi
+}
+
+function _build_validator {
+  if docker image inspect "$VALIDATOR_IMAGE" > /dev/null 2>&1; then
+    return
+  fi
+
+  echo "Building $VALIDATOR_IMAGE (one time)..." >&2
+  docker build --quiet --tag "$VALIDATOR_IMAGE" artifacts/env-validator > /dev/null
+}
+
+# Converts the spec to JSON and validates it in a single pass, echoing the
+# resolved spec -- the spec with every schema default filled in.
+function _resolve_spec {
+  local spec_file="$1"
+
+  if [[ ! -f "$spec_file" ]]; then
+    echo "bin/env: no such spec: $spec_file" >&2
+    return 1
+  fi
+
+  _build_validator
+
+  docker run --rm --interactive \
+    --volume "$PWD/$SCHEMA:/schema.json:ro" \
+    "$VALIDATOR_IMAGE" < "$spec_file"
+}
+
+function _spec_get {
+  jq --raw-output "$2" <<< "$1"
+}
+
+# The schema describes the whole of pass 1, but only a single leader is wired up
+# so far. Refuse the rest by name instead of provisioning something smaller than
+# the spec asked for. Deleted piecemeal as standbys, auto-failover and followers
+# land.
+function _refuse_unimplemented {
+  local resolved="$1"
+  local unimplemented=''
+
+  if [[ "$(_spec_get "$resolved" '.leader.standbys')" != 0 ]]; then
+    unimplemented+="  /leader/standbys: standbys are not implemented yet; only 0 is supported"$'\n'
+  fi
+
+  if [[ "$(_spec_get "$resolved" '.leader.auto_failover')" != false ]]; then
+    unimplemented+="  /leader/auto_failover: auto-failover is not implemented yet; only false is supported"$'\n'
+  fi
+
+  if [[ "$(_spec_get "$resolved" '.followers')" != 0 ]]; then
+    unimplemented+="  /followers: followers are not implemented yet; only 0 is supported"$'\n'
+  fi
+
+  if [[ -n "$unimplemented" ]]; then
+    {
+      echo 'bin/env: the spec is valid, but this build only provisions a single leader:'
+      printf '%s' "$unimplemented"
+      echo
+      echo 'Build these by hand with bin/dap for now; nothing was provisioned.'
+    } >&2
+    return 1
+  fi
+}
+
+#
+## Planning
+#
+
+# The ordered sequence of underlying commands, one per line. This is the whole
+# of the spec-to-sequence translation, which is why --plan is both what the
+# tests assert and what the skill shows before provisioning.
+function _provision_commands {
+  local resolved="$1"
+
+  echo "bin/dap --version $(_spec_get "$resolved" '.version') --provision-master"
+
+  # bin/dap returns as soon as `evoke configure master` does, which is before
+  # the appliance serves traffic. Everything after this point needs a healthy
+  # leader.
+  echo 'bin/dap --wait-for-master'
+
+  if [[ "$(_spec_get "$resolved" '.sample_data')" == true ]]; then
+    echo 'bin/api --load-sample-policy-and-values'
+  fi
+}
+
+function _check_descriptions {
+  local resolved="$1"
+
+  echo 'leader /health reports ok'
+  echo 'leader /info responds'
+  echo "leader image tag is $(_spec_get "$resolved" '.version')"
+  echo "standbys running is $(_spec_get "$resolved" '.leader.standbys')"
+  echo "followers running is $(_spec_get "$resolved" '.followers')"
+  echo "auto-failover configured is $(_spec_get "$resolved" '.leader.auto_failover')"
+
+  if [[ "$(_spec_get "$resolved" '.sample_data')" == true ]]; then
+    echo "sample secret $SAMPLE_SECRET is retrievable"
+  fi
+}
+
+function _numbered {
+  local number=0
+  local line
+
+  while IFS= read -r line; do
+    number=$((number + 1))
+    printf '  %d. %s\n' "$number" "$line"
+  done
+}
+
+function _print_plan {
+  local spec_file="$1"
+  local resolved="$2"
+
+  echo "Plan for $spec_file"
+  echo
+  echo 'Resolved spec:'
+  printf '  %-20s %s\n' 'version' "$(_spec_get "$resolved" '.version')"
+  printf '  %-20s %s\n' 'leader.standbys' "$(_spec_get "$resolved" '.leader.standbys')"
+  printf '  %-20s %s\n' 'leader.auto_failover' "$(_spec_get "$resolved" '.leader.auto_failover')"
+  printf '  %-20s %s\n' 'followers' "$(_spec_get "$resolved" '.followers')"
+  printf '  %-20s %s\n' 'sample_data' "$(_spec_get "$resolved" '.sample_data')"
+  echo
+  echo 'Commands:'
+  _provision_commands "$resolved" | _numbered
+  echo
+  echo 'Checks:'
+  _check_descriptions "$resolved" | _numbered
+}
+
+#
+## Provisioning
+#
+
+function _provision {
+  local resolved="$1"
+  local command
+
+  while IFS= read -r command; do
+    echo
+    echo "==> $command"
+    eval "$command"
+  done < <(_provision_commands "$resolved")
+}
+
+#
+## Verification
+#
+
+function _leader_health {
+  local body
+
+  if ! body="$(curl --insecure --silent --max-time 10 "https://localhost:${CONJUR_MASTER_PORT}/health")"; then
+    echo 'unreachable'
+    return
+  fi
+
+  jq --raw-output 'if .ok == true then "ok" else "not ok" end' <<< "$body" 2> /dev/null \
+    || echo 'unparseable'
+}
+
+# The `/info` probe doubles as the auto-failover check: an enrolled cluster
+# reports its name here, which is how the rest of bin/dap detects one.
+function _leader_cluster_name {
+  local body
+
+  if ! body="$(curl --insecure --silent --max-time 10 "https://localhost:${CONJUR_MASTER_PORT}/info")"; then
+    echo 'unreachable'
+    return
+  fi
+
+  jq --raw-output '.configuration.conjur.cluster_name // "none"' <<< "$body" 2> /dev/null \
+    || echo 'unparseable'
+}
+
+function _leader_info_state {
+  case "$(_leader_cluster_name)" in
+    unreachable | unparseable ) echo 'no' ;;
+    * ) echo 'yes' ;;
+  esac
+}
+
+function _auto_failover_state {
+  case "$(_leader_cluster_name)" in
+    production ) echo 'true' ;;
+    none ) echo 'false' ;;
+    * ) echo 'unknown' ;;
+  esac
+}
+
+# The tag the leader is actually running, which is what the spec asked for. This
+# deliberately compares the requested tag rather than the appliance's
+# self-reported build, so a symbolic tag like 5.0-stable verifies as cleanly as
+# a pinned one -- and a stale container left over from an earlier version still
+# shows up as a mismatch.
+function _leader_image_tag {
+  local container
+  local image
+
+  container="$(docker compose ps --quiet conjur-master-1.mycompany.local 2> /dev/null || true)"
+  if [[ -z "$container" ]]; then
+    echo 'not running'
+    return
+  fi
+
+  image="$(docker inspect --format '{{.Config.Image}}' "$container" 2> /dev/null || true)"
+  if [[ -z "$image" ]]; then
+    echo 'unknown'
+    return
+  fi
+
+  echo "${image##*:}"
+}
+
+function _running_standbys {
+  local count=0
+  local number
+
+  # The leader is conjur-master-1, so standbys start at 2.
+  for number in 2 3 4 5; do
+    if [[ -n "$(docker compose ps --quiet --status running "conjur-master-$number.mycompany.local" 2> /dev/null)" ]]; then
+      count=$((count + 1))
+    fi
+  done
+
+  echo "$count"
+}
+
+function _running_followers {
+  if [[ -n "$(docker compose ps --quiet --status running conjur-follower-1.mycompany.local 2> /dev/null)" ]]; then
+    echo 1
+  else
+    echo 0
+  fi
+}
+
+function _sample_data_state {
+  local secrets
+
+  if ! secrets="$(bin/api --against-master --fetch-secrets 2> /dev/null)"; then
+    echo 'not retrievable'
+    return
+  fi
+
+  if grep --quiet --fixed-strings "$SAMPLE_SECRET_VALUE" <<< "$secrets"; then
+    echo 'loaded'
+  else
+    echo 'not retrievable'
+  fi
+}
+
+VERIFY_ROWS=''
+VERIFY_MISMATCHED=false
+
+function _check {
+  local dimension="$1"
+  local desired="$2"
+  local actual="$3"
+  local result='ok'
+
+  if [[ "$desired" != "$actual" ]]; then
+    result='MISMATCH'
+    VERIFY_MISMATCHED=true
+  fi
+
+  VERIFY_ROWS+="$(printf '  %-20s %-14s %-14s %s' "$dimension" "$desired" "$actual" "$result")"$'\n'
+}
+
+function _verify {
+  local resolved="$1"
+
+  echo 'Verification'
+  echo
+
+  _check 'leader health' 'ok' "$(_leader_health)"
+  _check 'leader /info' 'yes' "$(_leader_info_state)"
+  _check 'leader image tag' "$(_spec_get "$resolved" '.version')" "$(_leader_image_tag)"
+  _check 'standbys running' "$(_spec_get "$resolved" '.leader.standbys')" "$(_running_standbys)"
+  _check 'followers running' "$(_spec_get "$resolved" '.followers')" "$(_running_followers)"
+  _check 'auto-failover' "$(_spec_get "$resolved" '.leader.auto_failover')" "$(_auto_failover_state)"
+
+  if [[ "$(_spec_get "$resolved" '.sample_data')" == true ]]; then
+    _check 'sample data' 'loaded' "$(_sample_data_state)"
+  fi
+
+  printf '  %-20s %-14s %-14s %s\n' 'DIMENSION' 'DESIRED' 'ACTUAL' 'RESULT'
+  printf '%s' "$VERIFY_ROWS"
+  echo
+
+  if [[ "$VERIFY_MISMATCHED" == true ]]; then
+    echo 'bin/env: the environment does not match the spec.' >&2
+    return 1
+  fi
+
+  echo 'The environment matches the spec.'
+  echo "Conjur is available at: 'https://localhost:${CONJUR_MASTER_PORT}'"
+}
+
+#
+## Entrypoint
+#
+
+# Verification can only be exercised against a running appliance, which the fast
+# tests deliberately do not have. Sourcing this file gives test/env.bats the
+# helpers above without the entrypoint below, so at least the table and the
+# exit-on-mismatch behaviour stay covered.
+if [[ -n "${BIN_ENV_SOURCE_ONLY:-}" ]]; then
+  return 0
+fi
+
+PLAN_ONLY=false
+SPEC_ARGUMENT=''
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --plan ) PLAN_ONLY=true ; shift ;;
+    -h | --help ) _print_help ;;
+    -* ) echo "bin/env: $1 is not a valid option" >&2 ; exit 1 ;;
+    * )
+      if [[ -n "$SPEC_ARGUMENT" ]]; then
+        echo "bin/env: only one spec may be given (got '$SPEC_ARGUMENT' and '$1')" >&2
+        exit 1
+      fi
+      SPEC_ARGUMENT="$1" ; shift ;;
+  esac
+done
+
+if [[ -z "$SPEC_ARGUMENT" ]]; then
+  echo 'bin/env: a spec file is required' >&2
+  echo "Try 'bin/env --help', or start from environments/examples/single-node.yml." >&2
+  exit 1
+fi
+
+if ! RESOLVED_SPEC="$(_resolve_spec "$(_spec_path "$SPEC_ARGUMENT")")"; then
+  echo 'bin/env: the spec was not accepted, so nothing was provisioned.' >&2
+  exit 1
+fi
+
+_refuse_unimplemented "$RESOLVED_SPEC"
+
+_print_plan "$SPEC_ARGUMENT" "$RESOLVED_SPEC"
+
+if [[ "$PLAN_ONLY" == true ]]; then
+  echo
+  echo 'Nothing was provisioned (--plan).'
+  exit 0
+fi
+
+_provision "$RESOLVED_SPEC"
+echo
+_verify "$RESOLVED_SPEC"

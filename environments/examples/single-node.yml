@@ -1,0 +1,23 @@
+# A single Conjur leader with the sample policy and secrets loaded -- the
+# smallest environment that is still useful for reproducing a customer issue.
+#
+#   bin/env --plan environments/examples/single-node.yml
+#   bin/env environments/examples/single-node.yml
+#
+# Every field below is at its default, so a spec containing nothing but the
+# `version:` line behaves identically. They are spelled out here because this
+# file doubles as documentation.
+#
+# Quote the version. Unquoted `13.5` is a YAML number, and unquoted `13.10`
+# would silently become 13.1.
+version: "5.0-stable"
+
+leader:
+  standbys: 0
+  auto_failover: false
+
+followers: 0
+
+sample_data: true
+
+# events: []   # reserved seam, deliberately unimplemented -- see the schema

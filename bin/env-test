@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+
+# Runs the fast tests for bin/env.
+#
+# These start no Conjur appliance containers and never contact registry.tld, so
+# they run in seconds anywhere docker is available. Integration testing stays a
+# manual run against a real appliance -- see docs/declarative-environments.md.
+#
+# Usage: bin/env-test [bats args...]   (defaults to test/env.bats)
+
+set -euo pipefail
+
+# Always work from repo root directory
+cd "$(dirname "${0}")/.."
+
+IMAGE='conjur-intro/bats:1.11.0'
+
+docker build --quiet --tag "$IMAGE" artifacts/bats > /dev/null
+
+# The repo is mounted at its host path, not at some path inside the container,
+# because bin/env asks the host docker daemon to bind-mount the schema. A daemon
+# outside this container can only resolve host paths.
+exec docker run --rm \
+  --volume /var/run/docker.sock:/var/run/docker.sock \
+  --volume "$PWD:$PWD" \
+  --workdir "$PWD" \
+  "$IMAGE" "${@:-test/env.bats}"
