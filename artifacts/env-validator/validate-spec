@@ -78,10 +78,29 @@ def problems(validator, document):
     return sorted(found)
 
 
+# Topology the schema describes but bin/env cannot build yet. The ceiling is 0
+# so that validating and being buildable stay the same thing; without these
+# hints the operator would see a bare range error and have no idea why.
+NOT_IMPLEMENTED = {
+    "/leader/standbys": "standbys are not provisioned yet",
+    "/leader/auto_failover": (
+        "auto-failover is not provisioned yet; it arrives with standby support"
+    ),
+    "/followers": "followers are not provisioned yet",
+}
+
+
 def hint_for(pointer, message):
     """Extra guidance for mistakes the schema can detect but not explain."""
     if pointer == "/version" and "is not of type 'string'" in message:
         return 'quote the version so YAML keeps it a string, e.g. version: "13.5"'
+
+    if pointer == "/version" and "does not match" in message:
+        return (
+            "the version is an appliance image tag, so it may hold only letters, "
+            "digits, dots, dashes and underscores -- and it has to, because it "
+            "reaches a command line"
+        )
 
     if pointer == "/events":
         return (
@@ -90,8 +109,11 @@ def hint_for(pointer, message):
             "bin/dap and see docs/declarative-environments.md"
         )
 
-    if pointer == "/leader/standbys" and "minimum of 2" in message:
-        return "auto_failover needs a quorum, so it requires at least 2 standbys"
+    if pointer in NOT_IMPLEMENTED and ("maximum of 0" in message or "expected" in message):
+        return (
+            f"{NOT_IMPLEMENTED[pointer]}; build this by hand with bin/dap for now, "
+            "and see docs/declarative-environments.md"
+        )
 
     return None
 

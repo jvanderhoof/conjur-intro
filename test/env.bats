@@ -89,7 +89,7 @@ bin/api --load-sample-policy-and-values' ]
 
   [ "$status" -eq 0 ]
   [[ "$(plan_checks)" == *'leader /health reports ok'* ]]
-  [[ "$(plan_checks)" == *'leader /info responds'* ]]
+  [[ "$(plan_checks)" == *'leader /info reports its configuration'* ]]
   [[ "$(plan_checks)" == *'leader image tag is 13.5'* ]]
   [[ "$(plan_checks)" == *'standbys running is 0'* ]]
   [[ "$(plan_checks)" == *'followers running is 0'* ]]
@@ -168,14 +168,26 @@ bin/dap --wait-for-master' ]
   [[ "$output" == *'quote the version'* ]]
 }
 
-@test "more standbys than the compose file defines is a range error" {
-  spec 'version: "13.5"' 'leader:' '  standbys: 5'
+@test "a version that could reach the shell as syntax is rejected" {
+  # The version is interpolated into a bin/dap invocation, so the schema's
+  # pattern is the thing standing between a spec file and arbitrary arguments.
+  spec 'version: "13.5 --provision-standbys"'
 
   run bin/env --plan "$SPEC"
 
   [ "$status" -ne 0 ]
-  [[ "$output" == *'/leader/standbys'* ]]
-  [[ "$output" == *'maximum of 4'* ]]
+  [[ "$output" == *'/version'* ]]
+  [[ "$output" == *'does not match'* ]]
+  [[ "$output" == *'reaches a command line'* ]]
+}
+
+@test "an empty version is rejected" {
+  spec 'version: ""'
+
+  run bin/env --plan "$SPEC"
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *'/version'* ]]
 }
 
 @test "a negative standby count is a range error" {
@@ -186,37 +198,6 @@ bin/dap --wait-for-master' ]
   [ "$status" -ne 0 ]
   [[ "$output" == *'/leader/standbys'* ]]
   [[ "$output" == *'minimum of 0'* ]]
-}
-
-@test "auto-failover without a quorum of standbys is a cross-field error" {
-  spec 'version: "13.5"' 'leader:' '  standbys: 1' '  auto_failover: true'
-
-  run bin/env --plan "$SPEC"
-
-  [ "$status" -ne 0 ]
-  [[ "$output" == *'/leader/standbys'* ]]
-  [[ "$output" == *'minimum of 2'* ]]
-}
-
-@test "auto-failover with enough standbys passes validation" {
-  spec 'version: "13.5"' 'leader:' '  standbys: 2' '  auto_failover: true'
-
-  run bin/env --plan "$SPEC"
-
-  # Valid per the schema, so it must fail at the not-yet-implemented guard
-  # rather than at validation.
-  [ "$status" -ne 0 ]
-  [[ "$output" != *'spec error'* ]]
-}
-
-@test "more followers than are supported is a range error" {
-  spec 'version: "13.5"' 'followers: 2'
-
-  run bin/env --plan "$SPEC"
-
-  [ "$status" -ne 0 ]
-  [[ "$output" == *'/followers'* ]]
-  [[ "$output" == *'maximum of 1'* ]]
 }
 
 @test "a non-boolean sample_data is a type error" {
@@ -275,28 +256,41 @@ bin/dap --wait-for-master' ]
 }
 
 #
-## Topology that the schema allows but this pass does not yet build
+## Topology this pass cannot build yet
 #
+# The schema's ceilings, not a conditional in bin/env, are what refuse these --
+# so a hand-written spec fails exactly where a generated one does, and never
+# gets far enough to build something smaller than it asked for.
 
-@test "standbys are refused as not yet implemented, naming the pointer" {
+@test "standbys are refused by the schema, naming the pointer" {
   spec 'version: "13.5"' 'leader:' '  standbys: 2'
 
   run bin/env --plan "$SPEC"
 
   [ "$status" -ne 0 ]
   [[ "$output" == *'/leader/standbys'* ]]
-  [[ "$output" == *'not implemented'* ]]
+  [[ "$output" == *'standbys are not provisioned yet'* ]]
   [[ "$output" == *'nothing was provisioned'* ]]
 }
 
-@test "a follower is refused as not yet implemented" {
+@test "auto-failover is refused by the schema" {
+  spec 'version: "13.5"' 'leader:' '  auto_failover: true'
+
+  run bin/env --plan "$SPEC"
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *'/leader/auto_failover'* ]]
+  [[ "$output" == *'auto-failover is not provisioned yet'* ]]
+}
+
+@test "a follower is refused by the schema" {
   spec 'version: "13.5"' 'followers: 1'
 
   run bin/env --plan "$SPEC"
 
   [ "$status" -ne 0 ]
   [[ "$output" == *'/followers'* ]]
-  [[ "$output" == *'not implemented'* ]]
+  [[ "$output" == *'followers are not provisioned yet'* ]]
 }
 
 #
@@ -310,9 +304,9 @@ bin/dap --wait-for-master' ]
   spec 'version: "13.5"' 'sample_data: false'
 
   BIN_ENV_SOURCE_ONLY=1 source bin/env
-  resolved="$(_resolve_spec "$SPEC")"
+  _read_spec "$(_resolve_spec "$SPEC")"
 
-  run _verify "$resolved"
+  run _verify
 
   [ "$status" -ne 0 ]
   [[ "$output" == *'DIMENSION'* ]]
@@ -327,9 +321,9 @@ bin/dap --wait-for-master' ]
   spec 'version: "13.5"' 'sample_data: false'
 
   BIN_ENV_SOURCE_ONLY=1 source bin/env
-  resolved="$(_resolve_spec "$SPEC")"
+  _read_spec "$(_resolve_spec "$SPEC")"
 
-  run _verify "$resolved"
+  run _verify
 
   # Nothing is running, so the actual counts are the 0 the spec asked for and
   # these two rows are the only ones that agree.

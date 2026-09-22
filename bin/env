@@ -50,16 +50,16 @@ Usage: bin/env [options] <spec>:
     -h, --help      Shows this help message.
 
 The spec is a YAML file validated against $SCHEMA; an unknown or
-misspelled key is a hard error. Start from
-environments/examples/single-node.yml.
+misspelled key, or a topology bin/env cannot build, is a hard error naming the
+offending field. Start from environments/examples/single-node.yml.
 
 Specs written directly into environments/ are gitignored. This repo is mirrored
 to the public conjurdemos GitHub org, so customer hostnames and admin passwords
 must never end up in a tracked file.
 
-Multiple standbys, auto-failover and followers are described by the schema but
-are not provisioned yet; bin/env says so rather than quietly building something
-smaller. Set them up with bin/dap by hand until then.
+Standbys, auto-failover and followers are not provisioned yet, so the schema
+rejects them rather than letting bin/env quietly build something smaller. Set
+them up with bin/dap by hand until then.
 
 See docs/declarative-environments.md.
 
@@ -74,21 +74,17 @@ EOF
 function _spec_path {
   local given="$1"
 
-  if [[ "$given" = /* ]]; then
-    echo "$given"
-  elif [[ -f "$CALLER_PWD/$given" ]]; then
+  if [[ "$given" != /* ]] && [[ -f "$CALLER_PWD/$given" ]]; then
     echo "$CALLER_PWD/$given"
   else
     echo "$given"
   fi
 }
 
+# Always rebuilt, never skipped when the tag already exists: a cached build takes
+# a fraction of a second, whereas a stale validator would keep applying an old
+# copy of the schema logic and say nothing.
 function _build_validator {
-  if docker image inspect "$VALIDATOR_IMAGE" > /dev/null 2>&1; then
-    return
-  fi
-
-  echo "Building $VALIDATOR_IMAGE (one time)..." >&2
   docker build --quiet --tag "$VALIDATOR_IMAGE" artifacts/env-validator > /dev/null
 }
 
@@ -109,39 +105,15 @@ function _resolve_spec {
     "$VALIDATOR_IMAGE" < "$spec_file"
 }
 
-function _spec_get {
-  jq --raw-output "$2" <<< "$1"
-}
-
-# The schema describes the whole of pass 1, but only a single leader is wired up
-# so far. Refuse the rest by name instead of provisioning something smaller than
-# the spec asked for. Deleted piecemeal as standbys, auto-failover and followers
-# land.
-function _refuse_unimplemented {
+# Reads the resolved spec into one variable per field. Done once, so that the
+# rest of the script reads plainly and does not spawn a jq per field.
+function _read_spec {
   local resolved="$1"
-  local unimplemented=''
 
-  if [[ "$(_spec_get "$resolved" '.leader.standbys')" != 0 ]]; then
-    unimplemented+="  /leader/standbys: standbys are not implemented yet; only 0 is supported"$'\n'
-  fi
-
-  if [[ "$(_spec_get "$resolved" '.leader.auto_failover')" != false ]]; then
-    unimplemented+="  /leader/auto_failover: auto-failover is not implemented yet; only false is supported"$'\n'
-  fi
-
-  if [[ "$(_spec_get "$resolved" '.followers')" != 0 ]]; then
-    unimplemented+="  /followers: followers are not implemented yet; only 0 is supported"$'\n'
-  fi
-
-  if [[ -n "$unimplemented" ]]; then
-    {
-      echo 'bin/env: the spec is valid, but this build only provisions a single leader:'
-      printf '%s' "$unimplemented"
-      echo
-      echo 'Build these by hand with bin/dap for now; nothing was provisioned.'
-    } >&2
-    return 1
-  fi
+  IFS=$'\t' read -r SPEC_VERSION SPEC_STANDBYS SPEC_AUTO_FAILOVER SPEC_FOLLOWERS SPEC_SAMPLE_DATA \
+    <<< "$(jq --raw-output \
+      '[.version, .leader.standbys, .leader.auto_failover, .followers, .sample_data] | @tsv' \
+      <<< "$resolved")"
 }
 
 #
@@ -152,31 +124,27 @@ function _refuse_unimplemented {
 # of the spec-to-sequence translation, which is why --plan is both what the
 # tests assert and what the skill shows before provisioning.
 function _provision_commands {
-  local resolved="$1"
-
-  echo "bin/dap --version $(_spec_get "$resolved" '.version') --provision-master"
+  echo "bin/dap --version $SPEC_VERSION --provision-master"
 
   # bin/dap returns as soon as `evoke configure master` does, which is before
   # the appliance serves traffic. Everything after this point needs a healthy
   # leader.
   echo 'bin/dap --wait-for-master'
 
-  if [[ "$(_spec_get "$resolved" '.sample_data')" == true ]]; then
+  if [[ "$SPEC_SAMPLE_DATA" == true ]]; then
     echo 'bin/api --load-sample-policy-and-values'
   fi
 }
 
 function _check_descriptions {
-  local resolved="$1"
-
   echo 'leader /health reports ok'
-  echo 'leader /info responds'
-  echo "leader image tag is $(_spec_get "$resolved" '.version')"
-  echo "standbys running is $(_spec_get "$resolved" '.leader.standbys')"
-  echo "followers running is $(_spec_get "$resolved" '.followers')"
-  echo "auto-failover configured is $(_spec_get "$resolved" '.leader.auto_failover')"
+  echo 'leader /info reports its configuration'
+  echo "leader image tag is $SPEC_VERSION"
+  echo "standbys running is $SPEC_STANDBYS"
+  echo "followers running is $SPEC_FOLLOWERS"
+  echo "auto-failover configured is $SPEC_AUTO_FAILOVER"
 
-  if [[ "$(_spec_get "$resolved" '.sample_data')" == true ]]; then
+  if [[ "$SPEC_SAMPLE_DATA" == true ]]; then
     echo "sample secret $SAMPLE_SECRET is retrievable"
   fi
 }
@@ -193,22 +161,21 @@ function _numbered {
 
 function _print_plan {
   local spec_file="$1"
-  local resolved="$2"
 
   echo "Plan for $spec_file"
   echo
   echo 'Resolved spec:'
-  printf '  %-20s %s\n' 'version' "$(_spec_get "$resolved" '.version')"
-  printf '  %-20s %s\n' 'leader.standbys' "$(_spec_get "$resolved" '.leader.standbys')"
-  printf '  %-20s %s\n' 'leader.auto_failover' "$(_spec_get "$resolved" '.leader.auto_failover')"
-  printf '  %-20s %s\n' 'followers' "$(_spec_get "$resolved" '.followers')"
-  printf '  %-20s %s\n' 'sample_data' "$(_spec_get "$resolved" '.sample_data')"
+  printf '  %-20s %s\n' 'version' "$SPEC_VERSION"
+  printf '  %-20s %s\n' 'leader.standbys' "$SPEC_STANDBYS"
+  printf '  %-20s %s\n' 'leader.auto_failover' "$SPEC_AUTO_FAILOVER"
+  printf '  %-20s %s\n' 'followers' "$SPEC_FOLLOWERS"
+  printf '  %-20s %s\n' 'sample_data' "$SPEC_SAMPLE_DATA"
   echo
   echo 'Commands:'
-  _provision_commands "$resolved" | _numbered
+  _provision_commands | _numbered
   echo
   echo 'Checks:'
-  _check_descriptions "$resolved" | _numbered
+  _check_descriptions | _numbered
 }
 
 #
@@ -216,55 +183,68 @@ function _print_plan {
 #
 
 function _provision {
-  local resolved="$1"
   local command
+  local argv
 
   while IFS= read -r command; do
     echo
     echo "==> $command"
-    eval "$command"
-  done < <(_provision_commands "$resolved")
+
+    # Split the planned command into an argument list and run it directly rather
+    # than through eval. The version comes from a spec file, and no value out of
+    # a spec should ever be able to turn into shell syntax.
+    IFS=' ' read -r -a argv <<< "$command"
+    "${argv[@]}"
+  done < <(_provision_commands)
 }
 
 #
 ## Verification
 #
 
-function _leader_health {
+# Reads one field out of a leader API route, reporting why it could not rather
+# than failing. `unreachable` means nothing answered; `unparseable` means
+# something did, but not the JSON we expected -- an HAProxy error page, say.
+function _leader_probe {
+  local route="$1"
+  local filter="$2"
   local body
 
-  if ! body="$(curl --insecure --silent --max-time 10 "https://localhost:${CONJUR_MASTER_PORT}/health")"; then
+  if ! body="$(curl --insecure --silent --max-time 10 "https://localhost:${CONJUR_MASTER_PORT}/$route")"; then
     echo 'unreachable'
     return
   fi
 
-  jq --raw-output 'if .ok == true then "ok" else "not ok" end' <<< "$body" 2> /dev/null \
-    || echo 'unparseable'
+  # --exit-status so that a null result counts as a failure rather than printing
+  # the word "null" into the table.
+  local value
+  if value="$(jq --raw-output --exit-status "$filter" <<< "$body" 2> /dev/null)"; then
+    echo "$value"
+  else
+    echo 'unparseable'
+  fi
 }
 
-# The `/info` probe doubles as the auto-failover check: an enrolled cluster
-# reports its name here, which is how the rest of bin/dap detects one.
+function _leader_health {
+  _leader_probe 'health' 'if .ok == true then "ok" else "not ok" end'
+}
+
+# An enrolled auto-failover cluster reports its name under /info, which is how
+# the rest of bin/dap detects one. `none` means /info answered with a
+# configuration but no cluster, which is what a standalone leader looks like.
 function _leader_cluster_name {
-  local body
-
-  if ! body="$(curl --insecure --silent --max-time 10 "https://localhost:${CONJUR_MASTER_PORT}/info")"; then
-    echo 'unreachable'
-    return
-  fi
-
-  jq --raw-output '.configuration.conjur.cluster_name // "none"' <<< "$body" 2> /dev/null \
-    || echo 'unparseable'
+  _leader_probe 'info' 'if .configuration.conjur then .configuration.conjur.cluster_name // "none" else null end'
 }
 
 function _leader_info_state {
-  case "$(_leader_cluster_name)" in
+  case "$1" in
     unreachable | unparseable ) echo 'no' ;;
-    * ) echo 'yes' ;;
+    * ) echo 'reported' ;;
   esac
 }
 
 function _auto_failover_state {
-  case "$(_leader_cluster_name)" in
+  case "$1" in
     production ) echo 'true' ;;
     none ) echo 'false' ;;
     * ) echo 'unknown' ;;
@@ -350,19 +330,25 @@ function _check {
 }
 
 function _verify {
-  local resolved="$1"
+  local cluster_name
+
+  VERIFY_ROWS=''
+  VERIFY_MISMATCHED=false
 
   echo 'Verification'
   echo
 
-  _check 'leader health' 'ok' "$(_leader_health)"
-  _check 'leader /info' 'yes' "$(_leader_info_state)"
-  _check 'leader image tag' "$(_spec_get "$resolved" '.version')" "$(_leader_image_tag)"
-  _check 'standbys running' "$(_spec_get "$resolved" '.leader.standbys')" "$(_running_standbys)"
-  _check 'followers running' "$(_spec_get "$resolved" '.followers')" "$(_running_followers)"
-  _check 'auto-failover' "$(_spec_get "$resolved" '.leader.auto_failover')" "$(_auto_failover_state)"
+  # One /info call serves both the probe row and the auto-failover row.
+  cluster_name="$(_leader_cluster_name)"
 
-  if [[ "$(_spec_get "$resolved" '.sample_data')" == true ]]; then
+  _check 'leader health' 'ok' "$(_leader_health)"
+  _check 'leader /info' 'reported' "$(_leader_info_state "$cluster_name")"
+  _check 'leader image tag' "$SPEC_VERSION" "$(_leader_image_tag)"
+  _check 'standbys running' "$SPEC_STANDBYS" "$(_running_standbys)"
+  _check 'followers running' "$SPEC_FOLLOWERS" "$(_running_followers)"
+  _check 'auto-failover' "$SPEC_AUTO_FAILOVER" "$(_auto_failover_state "$cluster_name")"
+
+  if [[ "$SPEC_SAMPLE_DATA" == true ]]; then
     _check 'sample data' 'loaded' "$(_sample_data_state)"
   fi
 
@@ -419,9 +405,8 @@ if ! RESOLVED_SPEC="$(_resolve_spec "$(_spec_path "$SPEC_ARGUMENT")")"; then
   exit 1
 fi
 
-_refuse_unimplemented "$RESOLVED_SPEC"
-
-_print_plan "$SPEC_ARGUMENT" "$RESOLVED_SPEC"
+_read_spec "$RESOLVED_SPEC"
+_print_plan "$SPEC_ARGUMENT"
 
 if [[ "$PLAN_ONLY" == true ]]; then
   echo
@@ -429,6 +414,6 @@ if [[ "$PLAN_ONLY" == true ]]; then
   exit 0
 fi
 
-_provision "$RESOLVED_SPEC"
+_provision
 echo
-_verify "$RESOLVED_SPEC"
+_verify

@@ -197,13 +197,14 @@ to the public `conjurdemos` GitHub org and real specs carry customer hostnames
 and admin passwords. Only the schema and the sanitized examples under
 `environments/examples/` are tracked.
 
-Multiple standbys, auto-failover and followers are described by the schema but
-are not provisioned yet — `bin/env` says so and provisions nothing, rather than
-quietly building something smaller than you asked for. Use `bin/dap` for those
-until they land.
+Standbys, auto-failover and followers are not provisioned yet, so the schema
+refuses them outright rather than letting `bin/env` quietly build something
+smaller than you asked for. The accepted range of each field widens as `bin/env`
+learns to build it, which keeps "validates" and "can be provisioned" the same
+claim. Use `bin/dap` for those topologies until they land.
 
-Run the fast tests with `bin/env-test`. They take about nine seconds and need no
-appliance containers and no `registry.tld` access. See
+Run the fast tests with `bin/env-test`. They start no appliance containers and
+need no `registry.tld` access, so they finish in seconds. See
 [docs/declarative-environments.md](docs/declarative-environments.md) for the
 design, the decision log, and what is deliberately out of scope.
 

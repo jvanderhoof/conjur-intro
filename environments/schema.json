@@ -2,15 +2,17 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/conjurdemos/conjur-intro/environments/schema.json",
   "title": "conjur-intro declarative environment",
-  "description": "Describes the end state of a Conjur environment so it can be provisioned reproducibly. This is the contract for bin/env: an unsupported or misspelled key is a hard error rather than a silent no-op. See docs/declarative-environments.md.",
+  "description": "Describes the end state of a Conjur environment so it can be provisioned reproducibly. This is the contract for bin/env: an unsupported or misspelled key is a hard error rather than a silent no-op. Every constraint lives here rather than in bin/env, so a hand-written spec fails the same way a generated one does, and the accepted range of each field widens only as bin/env learns to build it -- a spec that validates is a spec that can be provisioned. See docs/declarative-environments.md.",
   "type": "object",
   "additionalProperties": false,
   "required": ["version"],
   "properties": {
     "version": {
-      "description": "Appliance image tag to provision, as passed to `bin/dap --version`. Must be a quoted string: unquoted `13.5` is a YAML number, and unquoted `13.10` would silently become 13.1.",
+      "description": "Appliance image tag to provision, as passed to `bin/dap --version`. Must be a quoted string: unquoted `13.5` is a YAML number, and unquoted `13.10` would silently become 13.1. The pattern is docker's own tag grammar, and it matters because this value reaches a command line.",
       "type": "string",
-      "minLength": 1
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9_][A-Za-z0-9._-]*$",
+      "maxLength": 128
     },
     "leader": {
       "description": "The leader and its standby cluster.",
@@ -19,37 +21,25 @@
       "default": {},
       "properties": {
         "standbys": {
-          "description": "Number of standbys to deploy alongside the leader. docker-compose.yml defines conjur-master-2 through conjur-master-5, so 4 is the ceiling.",
+          "description": "Number of standbys to deploy alongside the leader. Only 0 validates today, because bin/env does not provision standbys yet. The ceiling rises to 4 -- the number of conjur-master services docker-compose.yml defines -- when it does.",
           "type": "integer",
           "minimum": 0,
-          "maximum": 4,
+          "maximum": 0,
           "default": 0
         },
         "auto_failover": {
-          "description": "Enrol the leader and its standbys in an auto-failover cluster. Requires at least 2 standbys, because a cluster needs a quorum to promote.",
+          "description": "Enrol the leader and its standbys in an auto-failover cluster. Only false validates today. Auto-failover, and the constraint that it needs at least 2 standbys to hold a quorum, arrive together with standby support.",
           "type": "boolean",
+          "const": false,
           "default": false
         }
-      },
-      "allOf": [
-        {
-          "if": {
-            "type": "object",
-            "properties": { "auto_failover": { "const": true } },
-            "required": ["auto_failover"]
-          },
-          "then": {
-            "properties": { "standbys": { "minimum": 2 } },
-            "required": ["standbys"]
-          }
-        }
-      ]
+      }
     },
     "followers": {
-      "description": "Number of followers to deploy behind the follower load balancer. Multi-follower support needs new compose services and generated haproxy backends, so 1 is the ceiling for now.",
+      "description": "Number of followers to deploy behind the follower load balancer. Only 0 validates today, because bin/env does not provision followers yet. The ceiling rises to 1 when it does, and beyond that once multi-follower compose services exist.",
       "type": "integer",
       "minimum": 0,
-      "maximum": 1,
+      "maximum": 0,
       "default": 0
     },
     "sample_data": {

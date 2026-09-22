@@ -3,8 +3,8 @@
 **Status:** Partly implemented. The walking skeleton — schema, validation, `--plan`,
 single-leader provisioning, verification and fast tests — is in place. Standbys,
 auto-failover, followers, the leader-hardening flags, the guard rails and the
-`conjur-env` skill are not. `bin/env` refuses the topology it cannot build rather
-than provisioning something smaller.
+`conjur-env` skill are not. The schema refuses the topology `bin/env` cannot build
+rather than letting it provision something smaller.
 **Date:** 2026-09-22
 **Scope:** Proof of concept. End-to-end first; robustness in later passes.
 
@@ -39,7 +39,7 @@ and is small enough to keep honest.
 
 | Path | Tracked? | Purpose |
 |---|---|---|
-| `environments/schema.json` | yes | The contract. `additionalProperties: false`, so an unsupported or typo'd key is a hard error rather than a silent no-op. Cross-field constraints live here. |
+| `environments/schema.json` | yes | The contract. `additionalProperties: false`, so an unsupported or typo'd key is a hard error rather than a silent no-op. Range and cross-field constraints live here, never in `bin/env`. |
 | `environments/examples/*.yml` | yes | Sanitized specs (single-node, HA-with-auto-failover, later multi-follower). Double as documentation and as test fixtures. |
 | `environments/*.yml` | **no — gitignored** | Real customer specs. |
 | `bin/env` | yes | The entrypoint. |
@@ -57,12 +57,12 @@ Only the schema and the sanitized examples are.
 ```yaml
 version: "13.5"          # quoted: unquoted 13.10 is the YAML number 13.1
 leader:
-  standbys: 2            # 0-4
-  auto_failover: true    # requires standbys >= 2
-  master_key_encryption: true
-  custom_certificates: true
-  generate_dh: false
-followers: 1             # 0 or 1 in pass 1
+  standbys: 2            # eventually 0-4; only 0 validates today
+  auto_failover: true    # eventually requires standbys >= 2; only false today
+  master_key_encryption: true   # not in the schema yet
+  custom_certificates: true     # not in the schema yet
+  generate_dh: false            # not in the schema yet
+followers: 1             # eventually 0 or 1; only 0 validates today
 sample_data: true        # default; runs bin/api --load-sample-policy-and-values
 
 # events: []             # reserved seam, not implemented
@@ -78,6 +78,23 @@ Each field enters the schema as it becomes buildable, so that
 `version`, `leader.standbys`, `leader.auto_failover`, `followers`, `sample_data`
 and the reserved `events`; the three leader-hardening flags arrive with the
 ticket that wires them up.
+
+**A field's accepted *range* narrows the same way.** In pass 1 `standbys` and
+`followers` are `maximum: 0` and `auto_failover` is `const: false`, so a spec
+asking for a cluster is rejected by the schema rather than by a conditional in
+`bin/env`. The ceilings rise — `standbys` to 4, `followers` to 1, then beyond —
+as each is actually wired up, and the cross-field rule that auto-failover needs
+at least 2 standbys for a quorum arrives with them. Keeping the refusal in the
+schema is what makes "a spec that validates is a spec that can be provisioned"
+true, and what makes a hand-written spec fail exactly where a generated one
+does. The validator supplies the hint (*"standbys are not provisioned yet"*) that
+a bare range error cannot.
+
+The version is also pattern-constrained to docker's tag grammar, because it
+reaches a `bin/dap` command line. A spec file is an input, and no value out of
+one should be able to turn into shell syntax or extra arguments; `bin/env`
+splits the planned command into an argument vector rather than running it
+through `eval`.
 
 **End state only.** The spec describes a topology, not how the customer got there.
 
@@ -131,10 +148,11 @@ wrong. Rebuild-from-clean needs none of it, and matches how repro work actually 
 ### Testing
 
 `test/env.bats` asserts the `--plan` output for every tracked example spec, plus the
-validation failures. Run it with `bin/env-test`. It takes about nine seconds, starts
+validation failures. Run it with `bin/env-test`. It finishes in seconds, starts
 no appliance containers and never touches `registry.tld`, so it can genuinely run in
 CI — unlike the existing cucumber suite, which `ci/bin/end-to-end-tests` can drive
-but which the `Jenkinsfile` never invokes.
+but which the `Jenkinsfile` never invokes. Wiring it into the `Jenkinsfile` is
+deliberately left to the separate CI effort noted under known debt.
 
 It is not container-*free*: the spec validator is a container by design, so the
 tests build and run that one small image, and `bin/env-test` runs bats itself in a
@@ -231,6 +249,7 @@ back into a spec.
 | Spec location | `environments/` gitignored; examples and schema tracked | The repo is publicly mirrored. |
 | Implementation | Bash, like the rest of `bin/` | Consistency; no new host dependency. |
 | Validation | JSON Schema, enforced in the YAML-conversion container | The schema is the contract, not documentation that drifts. |
+| Unbuilt topology | Refused by the schema's ranges, not by a check in `bin/env` | Keeps "validates" and "is buildable" one claim, and makes hand-written and generated specs fail identically. |
 | Checks | Preflight plus desired-vs-actual verification | A repro is only useful if the environment really is what the ticket described. |
 | Podman | Unsupported, explicitly | Avoids a third fork of drifted provisioning logic. |
 | Testing | `--plan` plus bats; integration manual | Tests what will regress, without pretending to cover what CI can't reach. |
