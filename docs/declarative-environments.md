@@ -1,5 +1,9 @@
 # Declarative Environments — design
 
+This is the design record: what was decided, why, and what is deliberately out of
+scope. For how to actually use the thing, see
+[environments.md](environments.md).
+
 **Status:** Partly implemented. The walking skeleton — schema, validation, `--plan`,
 single-leader provisioning, verification and fast tests — is in place. Standbys,
 auto-failover, followers, the leader-hardening flags, the guard rails and the

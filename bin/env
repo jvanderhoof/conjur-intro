@@ -40,9 +40,7 @@ function _print_help {
 
 Provisions a Conjur environment from a declarative spec.
 
-Synopsis: bin/env [options] <spec>
-
-Usage: bin/env [options] <spec>:
+Usage: bin/env [options] <spec>
 
     --plan          Print the ordered command sequence and the checks that would
                       follow it, then exit without provisioning anything.
@@ -61,7 +59,8 @@ Standbys, auto-failover and followers are not provisioned yet, so the schema
 rejects them rather than letting bin/env quietly build something smaller. Set
 them up with bin/dap by hand until then.
 
-See docs/declarative-environments.md.
+Usage and troubleshooting: docs/environments.md
+Design and decisions:      docs/declarative-environments.md
 
 EOF
   exit
@@ -326,7 +325,9 @@ function _check {
     VERIFY_MISMATCHED=true
   fi
 
-  VERIFY_ROWS+="$(printf '  %-20s %-14s %-14s %s' "$dimension" "$desired" "$actual" "$result")"$'\n'
+  # 16 wide because `not retrievable` is the longest value either column holds;
+  # a narrower column shifts RESULT right and the table stops scanning cleanly.
+  VERIFY_ROWS+="$(printf '  %-20s %-16s %-16s %s' "$dimension" "$desired" "$actual" "$result")"$'\n'
 }
 
 function _verify {
@@ -352,7 +353,7 @@ function _verify {
     _check 'sample data' 'loaded' "$(_sample_data_state)"
   fi
 
-  printf '  %-20s %-14s %-14s %s\n' 'DIMENSION' 'DESIRED' 'ACTUAL' 'RESULT'
+  printf '  %-20s %-16s %-16s %s\n' 'DIMENSION' 'DESIRED' 'ACTUAL' 'RESULT'
   printf '%s' "$VERIFY_ROWS"
   echo
 

@@ -199,14 +199,15 @@ and admin passwords. Only the schema and the sanitized examples under
 
 Standbys, auto-failover and followers are not provisioned yet, so the schema
 refuses them outright rather than letting `bin/env` quietly build something
-smaller than you asked for. The accepted range of each field widens as `bin/env`
-learns to build it, which keeps "validates" and "can be provisioned" the same
-claim. Use `bin/dap` for those topologies until they land.
+smaller than you asked for. Use `bin/dap` for those topologies until they land.
 
-Run the fast tests with `bin/env-test`. They start no appliance containers and
-need no `registry.tld` access, so they finish in seconds. See
-[docs/declarative-environments.md](docs/declarative-environments.md) for the
-design, the decision log, and what is deliberately out of scope.
+Run the fast tests with `bin/env-test`; they start no appliance containers and
+need no `registry.tld` access.
+
+- **[docs/environments.md](docs/environments.md)** — usage: writing a spec, the
+  field reference, reading the verification table, troubleshooting.
+- **[docs/declarative-environments.md](docs/declarative-environments.md)** —
+  design: the decision log, non-goals, and known debt.
 
 ## Start a single DAP instance
 

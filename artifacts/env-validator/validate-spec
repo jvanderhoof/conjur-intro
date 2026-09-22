@@ -106,13 +106,13 @@ def hint_for(pointer, message):
         return (
             "event sequences (upgrades, promotions, triggered failovers) are a "
             "reserved seam and are not implemented; run them by hand with "
-            "bin/dap and see docs/declarative-environments.md"
+            "bin/dap and see docs/environments.md"
         )
 
     if pointer in NOT_IMPLEMENTED and ("maximum of 0" in message or "expected" in message):
         return (
             f"{NOT_IMPLEMENTED[pointer]}; build this by hand with bin/dap for now, "
-            "and see docs/declarative-environments.md"
+            "and see docs/environments.md"
         )
 
     return None
