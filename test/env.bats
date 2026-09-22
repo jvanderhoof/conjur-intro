@@ -1059,6 +1059,62 @@ JSON
   [[ "$(rows)" == *'standby 3 replication streaming not replicating MISMATCH'* ]]
 }
 
+# The other probe whose filter encodes a claim about what the appliance returns,
+# and so the other one that a stub of the probe itself cannot check. The JSON below
+# is what `evoke cluster member list` really printed for a three-node cluster: an
+# array of etcd members, the node hostname under `name`, and not in node order --
+# which is why membership is a lookup rather than a positional read.
+@test "cluster membership is read from etcd's own member list" {
+  spec 'version: "13.5"' 'sample_data: false' 'leader:' '  standbys: 2' '  auto_failover: true'
+
+  BIN_ENV_SOURCE_ONLY=1 source bin/env
+  _read_spec "$(_resolve_spec "$SPEC")"
+
+  docker() {
+    case "$*" in
+      *'evoke cluster member list'* )
+        echo '[{"id":"3a2a0df29e279581","name":"conjur-master-2.mycompany.local","peerURLs":["http://conjur-master-2.mycompany.local:2380"],"clientURLs":["http://127.0.0.1:2379"]},{"id":"a68a1d7f860d5e20","name":"conjur-master-3.mycompany.local","peerURLs":["http://conjur-master-3.mycompany.local:2380"],"clientURLs":["http://127.0.0.1:2379"]},{"id":"b8684da58a8cba14","name":"conjur-master-1.mycompany.local","peerURLs":["http://conjur-master-1.mycompany.local:2380"],"clientURLs":["http://127.0.0.1:2379"]}]' ;;
+      * ) return 1 ;;
+    esac
+  }
+
+  [ "$(_cluster_member_names | sort)" = 'conjur-master-1.mycompany.local
+conjur-master-2.mycompany.local
+conjur-master-3.mycompany.local' ]
+
+  local members
+  members="$(_cluster_member_names)"
+
+  [ "$(_cluster_membership_state 1 "$members")" = 'enrolled' ]
+  [ "$(_cluster_membership_state 3 "$members")" = 'enrolled' ]
+
+  # Node 4 is in no cluster because the spec asked for two standbys, and the
+  # hostname is a prefix of nothing in the list -- the match has to be the whole
+  # line, not a substring of one.
+  [ "$(_cluster_membership_state 4 "$members")" = 'missing' ]
+}
+
+# An appliance that answers with something other than a member list must read as
+# nothing enrolled rather than crash the run or, worse, pass: `set -o pipefail`
+# plus a jq that cannot parse is exactly the combination that took bin/env down
+# once before.
+@test "an unparseable member list reads as nothing enrolled" {
+  BIN_ENV_SOURCE_ONLY=1 source bin/env
+
+  docker() {
+    echo 'Error: etcdserver: request timed out'
+  }
+
+  run _cluster_member_names
+
+  # The status as much as the output: bin/env runs under `set -o pipefail`, so a
+  # jq that cannot parse takes the whole pipeline down with it -- at the exact
+  # moment verification is trying to report what it found.
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  [ "$(_cluster_membership_state 1 "$output")" = 'missing' ]
+}
+
 @test "an enrolled cluster is verified node by node, not just by the leader's health" {
   spec 'version: "13.5"' 'sample_data: false' 'leader:' '  standbys: 2' '  auto_failover: true'
 

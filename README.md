@@ -200,9 +200,13 @@ to the public `conjurdemos` GitHub org and real specs carry customer hostnames
 and admin passwords. Only the schema and the sanitized examples under
 `environments/examples/` are tracked.
 
-Standbys, auto-failover and followers are not provisioned yet, so the schema
+A leader can have up to four standbys, optionally enrolled in an auto-failover
+cluster — which the schema will not accept with fewer than two of them, because
+an etcd cluster of two nodes cannot elect a new leader when it loses one.
+[`environments/examples/highly-available.yml`](environments/examples/highly-available.yml)
+is the smallest such spec. Followers are not provisioned yet, so the schema
 refuses them outright rather than letting `bin/env` quietly build something
-smaller than you asked for. Use `bin/dap` for those topologies until they land.
+smaller than you asked for; use `bin/dap` for those until they land.
 
 Nothing is reconciled. A preflight checks up front that the appliance version
 resolves and the host ports are free, and an environment that already exists is

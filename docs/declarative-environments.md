@@ -246,7 +246,18 @@ two-standby cluster as `not replicating` on the first live run. The fix came wit
 test one seam lower — `curl` stubbed, the real probe called, against a body the
 appliance actually returned. Where a probe's filter encodes a claim about the
 appliance's JSON, that claim belongs in a test with a captured payload behind it;
-the payload is the part a stub cannot invent.
+the payload is the part a stub cannot invent. The cluster-membership probe has the
+same shape and so has the same pair of tests, one of them for the answer that does
+not parse at all — under `set -o pipefail` a jq that cannot read its input takes the
+run down at the moment verification is trying to report.
+
+Both were written after the code they cover, which makes them worth a moment's
+suspicion: a test written green proves only that it agrees with today's
+implementation. Each was checked by breaking the filter it pins and confirming it
+went red. That caught a genuinely empty one — asserting that an unparseable answer
+produces no output passes whether or not the pipeline survived it, because a failing
+command substitution does not fail the test around it. Asserting the exit status is
+what made it mean anything.
 
 `--plan` therefore serves two needs at once: it is what makes the
 spec→sequence translation testable, and it is what the skill shows before provisioning.
