@@ -170,6 +170,9 @@ $ bin/env --plan environments/examples/single-node.yml
 
 # Provision, then print a desired-vs-actual table
 $ bin/env environments/examples/single-node.yml
+
+# Destroy the environment already here and build the spec from clean
+$ bin/env --recreate environments/examples/single-node.yml
 ```
 
 A spec is YAML, validated against [`environments/schema.json`](environments/schema.json).
@@ -200,6 +203,12 @@ and admin passwords. Only the schema and the sanitized examples under
 Standbys, auto-failover and followers are not provisioned yet, so the schema
 refuses them outright rather than letting `bin/env` quietly build something
 smaller than you asked for. Use `bin/dap` for those topologies until they land.
+
+Nothing is reconciled. A preflight checks up front that the appliance version
+resolves and the host ports are free, and an environment that already exists is
+refused rather than half-configured — rebuild it with `--recreate`, which states
+plainly that it destroys the data, the replication seeds, the master key and the
+audit history. Podman is refused too, pointing at `bin/podman-dap`.
 
 Run the fast tests with `bin/env-test`; they start no appliance containers and
 need no `registry.tld` access.

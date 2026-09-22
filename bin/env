@@ -29,6 +29,14 @@ CONJUR_MASTER_PORT="${CONJUR_MASTER_PORT:-443}"
 VALIDATOR_IMAGE='conjur-intro/env-validator:1'
 SCHEMA='environments/schema.json'
 
+# The appliance image docker-compose.yml starts. Preflight resolves the
+# requested tag against this before anything is provisioned.
+APPLIANCE_IMAGE='registry.tld/conjur-appliance'
+
+# How long the registry gets to answer. Off VPN registry.tld does not answer at
+# all, and an unbounded TCP timeout is the opposite of failing fast.
+REGISTRY_TIMEOUT_SECONDS=30
+
 # One of the variables `bin/api --load-sample-policy-and-values` sets. Verifying
 # that this reads back is the difference between "the appliance is up" and "the
 # appliance is usable for a repro".
@@ -45,11 +53,23 @@ Usage: bin/env [options] <spec>
     --plan          Print the ordered command sequence and the checks that would
                       follow it, then exit without provisioning anything.
 
+    --recreate      Tear the existing environment down and build the spec from
+                      clean. This destroys every volume the environment holds:
+                      its data, its replication seeds, its master key and its
+                      audit history. The flag is the confirmation -- there is no
+                      second prompt -- so read what it prints before you use it.
+
     -h, --help      Shows this help message.
 
 The spec is a YAML file validated against $SCHEMA; an unknown or
 misspelled key, or a topology bin/env cannot build, is a hard error naming the
 offending field. Start from environments/examples/single-node.yml.
+
+Nothing is reconciled. If an environment already exists in this working copy,
+bin/env refuses rather than half-configuring it; rebuild with --recreate, or
+tear it down with bin/dap --stop. Before provisioning, a preflight checks that
+the requested appliance version resolves and that the host ports are free, so an
+environment that cannot come up fails in seconds rather than minutes.
 
 Specs written directly into environments/ are gitignored. This repo is mirrored
 to the public conjurdemos GitHub org, so customer hostnames and admin passwords
@@ -58,6 +78,8 @@ must never end up in a tracked file.
 Standbys, auto-failover and followers are not provisioned yet, so the schema
 rejects them rather than letting bin/env quietly build something smaller. Set
 them up with bin/dap by hand until then.
+
+Podman is not supported: use bin/podman-dap directly.
 
 Usage and troubleshooting: docs/environments.md
 Design and decisions:      docs/declarative-environments.md
@@ -116,6 +138,346 @@ function _read_spec {
 }
 
 #
+## Runtime
+#
+# Which container runtime this is does not depend on the spec, so this is settled
+# before the spec is even read, and outside preflight -- preflight is about the
+# environment being buildable, this is about bin/env being the right tool at all.
+
+# Whatever can be learned cheaply about the runtime the docker CLI talks to.
+# Separate from the check so the tests can stand in a podman host's answers, and
+# deliberately string-based: there is no single authoritative field, and any of
+# these naming podman is enough to stop.
+function _runtime_identity {
+  echo "${DOCKER_HOST:-}"
+
+  # Empty, not an error, when no daemon is reachable -- the refusal below must
+  # not depend on the thing it is refusing being up.
+  docker version --format '{{.Server.Platform.Name}}' 2> /dev/null || true
+  docker --version 2> /dev/null || true
+}
+
+# Runs for every invocation, --plan included: this is a fact about the machine
+# rather than about the spec, and a plan that could never run is worse than no
+# plan at all.
+function _refuse_podman {
+  if ! grep --quiet --ignore-case podman <<< "$(_runtime_identity)"; then
+    return 0
+  fi
+
+  echo 'bin/env: podman is not supported. Use bin/podman-dap directly.' >&2
+  echo 'bin/env:   bin/podman-dap is a drifted fork of bin/dap -- different host ports, no' >&2
+  echo 'bin/env:   master key encryption, a hardcoded standby count -- so a spec bin/env' >&2
+  echo 'bin/env:   accepts does not describe what it would build. A declarative layer over' >&2
+  echo 'bin/env:   it would misrepresent that, so there is deliberately not one.' >&2
+  exit 1
+}
+
+#
+## Preflight
+#
+# Read-only checks that run before the first provisioning command, so that an
+# environment which cannot possibly come up fails in seconds rather than six
+# minutes into `evoke configure master`.
+#
+# Nothing here has a side effect. With --recreate the teardown is a provisioning
+# command like any other, which is what keeps a failed check from leaving an
+# operator with a destroyed environment and no replacement.
+
+# Runs a command with a ceiling on how long it may take. `timeout` itself would
+# be a host dependency: macOS does not ship it.
+function _with_timeout {
+  local seconds="$1"
+  shift
+
+  local pid
+  local waited=0
+
+  "$@" &
+  pid=$!
+
+  while kill -0 "$pid" 2> /dev/null; do
+    if (( waited >= seconds )); then
+      kill "$pid" 2> /dev/null || true
+      wait "$pid" 2> /dev/null || true
+      # What timeout(1) reports, for the same reason.
+      return 124
+    fi
+
+    sleep 1
+    waited=$((waited + 1))
+  done
+
+  wait "$pid"
+}
+
+### An environment that already exists
+
+# Container ids belonging to this compose project, whatever state they are in.
+function _project_container_ids {
+  docker compose ps --all --quiet 2> /dev/null || true
+}
+
+# The containers this working copy already has, as `name (state)` lines. No
+# output means there is no environment here.
+function _existing_environment {
+  local ids
+  local names
+
+  ids="$(_project_container_ids)"
+  if [[ -z "$ids" ]]; then
+    return 0
+  fi
+
+  # Unquoted so each id is its own argument. Names are more use than ids in the
+  # refusal, but the ids are what we are certain of, so they are the fallback --
+  # which `|| true` is what makes reachable, since otherwise `set -o pipefail`
+  # turns an inspect of a container that has since gone into a silent exit here.
+  # shellcheck disable=SC2086
+  names="$(docker inspect --format '{{.Name}} ({{.State.Status}})' $ids 2> /dev/null | sed 's|^/||' || true)"
+
+  printf '%s\n' "${names:-$ids}"
+}
+
+function _refuse_existing_environment {
+  local existing="$1"
+
+  echo 'bin/env: an environment already exists in this working copy:' >&2
+  printf '%s\n' "$existing" | sed 's/^/  /' >&2
+  echo 'bin/env: nothing is reconciled, so this is refused rather than half-configured.' >&2
+  echo 'bin/env:   Rebuild it from clean with --recreate, which destroys its data, its' >&2
+  echo 'bin/env:   replication seeds, its master key and its audit history.' >&2
+  echo 'bin/env:   Or tear it down yourself with bin/dap --stop.' >&2
+  exit 1
+}
+
+### Host ports
+
+# The host ports the planned topology binds. docker compose fails on a port it
+# cannot bind, and it fails only after pulling the appliance image, so this is
+# worth knowing up front. Standby and follower ports join the list as those
+# topologies become buildable.
+function _required_ports {
+  echo "$CONJUR_MASTER_PORT"  # the leader load balancer
+  echo 444                    # the leader appliance, published directly
+  echo 7000                   # the leader load balancer's stats page
+}
+
+function _required_ports_list {
+  local joined=''
+  local port
+
+  while IFS= read -r port; do
+    joined+="${joined:+, }$port"
+  done < <(_required_ports)
+
+  echo "$joined"
+}
+
+# A process listening on a host port, named if the host has a tool that can say
+# which. Without one we can still tell that something answers, which is the part
+# that decides whether provisioning would fail.
+function _listener_on {
+  local port="$1"
+  local process
+
+  # The (LISTEN) column is checked as well as asked for: busybox's lsof ignores
+  # these options and lists every open file it can see, and taking its first
+  # line would name some unrelated process as the holder of a free port.
+  #
+  # `|| true` because a host with no lsof at all exits 127, and under `set -o
+  # pipefail` that would fail the assignment and take bin/env down here --
+  # silently, stderr being discarded -- rather than falling through below.
+  process="$(lsof -nP -iTCP:"$port" -sTCP:LISTEN 2> /dev/null \
+    | awk '$NF == "(LISTEN)" { print $1 " (pid " $2 ")" ; exit }' || true)"
+
+  if [[ -n "$process" ]]; then
+    echo "$process"
+    return 0
+  fi
+
+  # No lsof, or one that could not answer. Something accepting connections is
+  # still enough to know the port cannot be bound.
+  if (exec 3<> "/dev/tcp/127.0.0.1/$port") 2> /dev/null; then
+    echo 'an unidentified process'
+  fi
+}
+
+# What holds a host port, as a phrase to print, or nothing when it is free.
+function _port_holder {
+  local port="$1"
+  local ours
+  local id
+  local name
+  local mine=false
+
+  ours="$(_project_container_ids)"
+
+  # A container publishing the port is both the likeliest holder and the most
+  # useful thing to name.
+  for id in $(docker ps --filter "publish=$port" --quiet 2> /dev/null || true); do
+    # One of ours is not a conflict: the environment it belongs to is torn down
+    # before the new one needs the port. Returning early would instead report
+    # docker's own proxy process, and refuse to rebuild what it just described.
+    if [[ -n "$ours" ]] && grep --quiet --fixed-strings "$id" <<< "$ours"; then
+      mine=true
+      continue
+    fi
+
+    # `|| true` for the same reason as above: the id is the fallback, so a failed
+    # inspect has to fall through to it rather than end the run.
+    name="$(docker inspect --format '{{.Name}}' "$id" 2> /dev/null | sed 's|^/||' || true)"
+    echo "container ${name:-$id}"
+    return 0
+  done
+
+  if [[ "$mine" == true ]]; then
+    return 0
+  fi
+
+  _listener_on "$port"
+}
+
+### The appliance version
+
+function _image_in_local_cache {
+  docker image inspect "$APPLIANCE_IMAGE:$1" > /dev/null 2>&1
+}
+
+function _manifest_in_registry {
+  # --insecure because registry.tld's certificate is issued for another name.
+  # The daemon is configured to pull from it regardless, but `docker manifest`
+  # reaches the registry from the CLI and does not read that configuration, so
+  # without this every tag looks unresolvable.
+  _with_timeout "$REGISTRY_TIMEOUT_SECONDS" \
+    docker manifest inspect --insecure "$APPLIANCE_IMAGE:$1"
+}
+
+### The checks themselves, in the order they run
+#
+# Cheapest first, and the existing-environment check before the port one: a live
+# environment holds the ports it needs, and being told about port 443 when the
+# real answer is "you already have one of these" is a worse message.
+
+function _existing_environment_description {
+  if [[ "$RECREATE" == true ]]; then
+    echo 'any environment already here is torn down rather than reconciled (--recreate)'
+  else
+    echo 'no environment already exists in this working copy'
+  fi
+}
+
+function _ports_description {
+  echo "host ports $(_required_ports_list) are free"
+}
+
+function _version_description {
+  echo "appliance image $APPLIANCE_IMAGE:$SPEC_VERSION resolves"
+}
+
+function _preflight_existing_environment {
+  local existing
+
+  existing="$(_existing_environment)"
+
+  if [[ -n "$existing" ]] && [[ "$RECREATE" != true ]]; then
+    _refuse_existing_environment "$existing"
+  fi
+
+  echo "  ok  $(_existing_environment_description)"
+}
+
+function _refuse_ports {
+  local conflicts="$1"
+
+  echo 'bin/env: a host port this environment needs is already in use:' >&2
+  printf '%s' "$conflicts" >&2
+  echo 'bin/env:   CONJUR_MASTER_PORT moves the leader load balancer off 443; 444 and 7000' >&2
+  echo 'bin/env:   are fixed in docker-compose.yml, so those have to be freed.' >&2
+  exit 1
+}
+
+function _preflight_ports {
+  local port
+  local holder
+  local conflicts=''
+
+  while IFS= read -r port; do
+    holder="$(_port_holder "$port")"
+
+    if [[ -n "$holder" ]]; then
+      conflicts+="  port $port is held by $holder"$'\n'
+    fi
+  done < <(_required_ports)
+
+  if [[ -n "$conflicts" ]]; then
+    _refuse_ports "$conflicts"
+  fi
+
+  echo "  ok  $(_ports_description)"
+}
+
+# $1 is the exit status the lookup failed with, $2 whatever it said.
+function _refuse_version {
+  local status="$1"
+  local answer="$2"
+
+  echo "bin/env: appliance version $SPEC_VERSION does not resolve as $APPLIANCE_IMAGE:$SPEC_VERSION." >&2
+
+  if (( status == 124 )); then
+    echo "bin/env:   the registry did not answer within ${REGISTRY_TIMEOUT_SECONDS}s. registry.tld is" >&2
+    echo 'bin/env:   internal, so this is usually the VPN.' >&2
+  elif [[ "$answer" == *'no such manifest'* ]] || [[ "$answer" == *'manifest unknown'* ]]; then
+    echo 'bin/env:   the registry answered, and has no such tag. Check the version in the spec.' >&2
+  else
+    printf '%s\n' "$answer" | sed 's/^/bin\/env:   /' >&2
+    echo 'bin/env:   the registry could not be reached. registry.tld is internal, so this is' >&2
+    echo 'bin/env:   usually the VPN.' >&2
+  fi
+
+  echo 'bin/env:   A tag already pulled needs neither: docker images | grep conjur-appliance' >&2
+  exit 1
+}
+
+function _preflight_version {
+  local answer
+  local status=0
+
+  # bin/dap does not force a pull, so a tag already in the local cache
+  # provisions without the registry -- and so without the VPN.
+  if _image_in_local_cache "$SPEC_VERSION"; then
+    echo "  ok  $(_version_description) (local cache)"
+    return 0
+  fi
+
+  # stderr into the capture and stdout away: the manifest itself is of no
+  # interest, and the registry's own words are the useful part of a failure.
+  answer="$(_manifest_in_registry "$SPEC_VERSION" 2>&1 > /dev/null)" || status=$?
+
+  if (( status == 0 )); then
+    echo "  ok  $(_version_description) (registry)"
+    return 0
+  fi
+
+  _refuse_version "$status" "$answer"
+}
+
+function _preflight {
+  echo 'Preflight'
+  echo
+
+  _preflight_existing_environment
+  _preflight_ports
+  _preflight_version
+}
+
+function _preflight_descriptions {
+  _existing_environment_description
+  _ports_description
+  _version_description
+}
+
+#
 ## Planning
 #
 
@@ -123,6 +485,12 @@ function _read_spec {
 # of the spec-to-sequence translation, which is why --plan is both what the
 # tests assert and what the skill shows before provisioning.
 function _provision_commands {
+  # A clean rebuild rather than a reconcile, and a provisioning command rather
+  # than part of preflight, so that every check has passed before any data goes.
+  if [[ "$RECREATE" == true ]]; then
+    echo 'bin/dap --stop'
+  fi
+
   echo "bin/dap --version $SPEC_VERSION --provision-master"
 
   # bin/dap returns as soon as `evoke configure master` does, which is before
@@ -158,6 +526,24 @@ function _numbered {
   done
 }
 
+# What --recreate costs, in words. `bin/dap --stop` in a command list does not
+# say it, and this is the one thing bin/env does that cannot be undone.
+function _print_destruction_notice {
+  cat << EOF
+
+--recreate destroys the environment already here before building the new one.
+'bin/dap --stop' removes this compose project's volumes, and with them:
+
+  - every policy and secret value loaded into the leader
+  - the replication seeds held for any standby or follower
+  - the master key
+  - the audit database, and the audit history in it
+
+Nothing is backed up first, and none of it can be recovered afterwards. Passing
+--recreate is the confirmation; there is no second prompt.
+EOF
+}
+
 function _print_plan {
   local spec_file="$1"
 
@@ -170,11 +556,18 @@ function _print_plan {
   printf '  %-20s %s\n' 'followers' "$SPEC_FOLLOWERS"
   printf '  %-20s %s\n' 'sample_data' "$SPEC_SAMPLE_DATA"
   echo
+  echo 'Preflight:'
+  _preflight_descriptions | _numbered
+  echo
   echo 'Commands:'
   _provision_commands | _numbered
   echo
   echo 'Checks:'
   _check_descriptions | _numbered
+
+  if [[ "$RECREATE" == true ]]; then
+    _print_destruction_notice
+  fi
 }
 
 #
@@ -377,23 +770,43 @@ function _verify {
 }
 
 #
+## The build
+#
+
+# The three phases in the one order that is safe: everything is checked, then the
+# environment is built, then it is compared against the spec. Its own function so
+# that the ordering is a thing the tests can pin -- a preflight that refuses has
+# to mean nothing was provisioned, and that is the whole point of having one.
+function _build {
+  echo
+  _preflight
+  _provision
+  echo
+  _verify
+}
+
+#
 ## Entrypoint
 #
 
-# Verification can only be exercised against a running appliance, which the fast
-# tests deliberately do not have. Sourcing this file gives test/env.bats the
-# helpers above without the entrypoint below, so at least the table and the
-# exit-on-mismatch behaviour stay covered.
+# Set before the source-only return below, because the planner and the preflight
+# checks read them and test/env.bats reaches those by sourcing this file.
+PLAN_ONLY=false
+RECREATE=false
+SPEC_ARGUMENT=''
+
+# Verification and preflight can only be exercised in full against a running
+# appliance, which the fast tests deliberately do not have. Sourcing this file
+# gives test/env.bats the helpers above without the entrypoint below, so the
+# refusal paths, the table and the exit-on-mismatch behaviour stay covered.
 if [[ -n "${BIN_ENV_SOURCE_ONLY:-}" ]]; then
   return 0
 fi
 
-PLAN_ONLY=false
-SPEC_ARGUMENT=''
-
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --plan ) PLAN_ONLY=true ; shift ;;
+    --recreate ) RECREATE=true ; shift ;;
     -h | --help ) _print_help ;;
     -* ) echo "bin/env: $1 is not a valid option" >&2 ; exit 1 ;;
     * )
@@ -404,6 +817,11 @@ while [[ $# -gt 0 ]]; do
       SPEC_ARGUMENT="$1" ; shift ;;
   esac
 done
+
+# Before the spec is read: which container runtime this is does not depend on
+# what the spec asks for, and a plan podman could never carry out is worse than
+# no plan at all.
+_refuse_podman
 
 if [[ -z "$SPEC_ARGUMENT" ]]; then
   echo 'bin/env: a spec file is required' >&2
@@ -425,6 +843,4 @@ if [[ "$PLAN_ONLY" == true ]]; then
   exit 0
 fi
 
-_provision
-echo
-_verify
+_build

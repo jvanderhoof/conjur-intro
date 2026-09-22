@@ -5,8 +5,9 @@ scope. For how to actually use the thing, see
 [environments.md](environments.md).
 
 **Status:** Partly implemented. The walking skeleton — schema, validation, `--plan`,
-single-leader provisioning, verification and fast tests — is in place. Standbys,
-auto-failover, followers, the leader-hardening flags, the guard rails and the
+single-leader provisioning, verification and fast tests — is in place, and so are the
+guard rails: preflight, the refusal to reconcile, `--recreate`, and the podman
+refusal. Standbys, auto-failover, followers, the leader-hardening flags and the
 `conjur-env` skill are not. The schema refuses the topology `bin/env` cannot build
 rather than letting it provision something smaller.
 **Date:** 2026-09-22
@@ -124,13 +125,13 @@ pointer and abort before anything is provisioned.
 
 | Behavior | Shipped? | Detail |
 |---|---|---|
-| `--plan` | yes | Prints the ordered command sequence without executing. |
-| Preflight | no | The requested appliance tag resolves in `registry.tld`; required host ports are free. Fails in seconds rather than six minutes into a run. |
+| `--plan` | yes | Prints the ordered command sequence without executing, preceded by the preflight checks it would run. |
+| Preflight | yes | The requested appliance tag resolves — local cache first, then the registry under a 30s ceiling; required host ports are free; no environment already exists. Fails in seconds rather than six minutes into a run. |
 | Provision | yes | Sequences existing `bin/dap` / `bin/api` flags in dependency order. |
 | Verify | yes | Probes `/health`, `/info`, replication and cluster state; prints a desired-vs-actual table; exits non-zero on mismatch. |
-| Re-run | no | **No convergence.** If anything is running, refuse and direct the user to `--recreate`. |
-| `--recreate` | no | Tears down and rebuilds, stating plainly that volumes (seeds, MKE key, audit data) are destroyed. |
-| Podman | no | **Unsupported.** Refuses with a message pointing at `bin/podman-dap`. |
+| Re-run | yes | **No convergence.** If anything exists, refuse and direct the user to `--recreate`. |
+| `--recreate` | yes | Tears down and rebuilds, stating plainly that volumes (seeds, MKE key, audit data) are destroyed. |
+| Podman | yes | **Unsupported.** Refuses with a message pointing at `bin/podman-dap`. |
 
 Verification compares the *requested* image tag against the tag the leader
 container is actually running, rather than the appliance's self-reported build.
@@ -145,9 +146,31 @@ different host ports, and raw `podman run` instead of compose. A declarative lay
 over it would misrepresent what it can actually build, and a `bin/podman-env` would
 be a third copy of the same logic.
 
+Podman is detected by string-matching whatever the runtime will say about itself —
+`DOCKER_HOST`, `docker version`'s server platform, `docker --version`. There is no
+single authoritative field, any one of them naming podman is enough to stop, and the
+check must not depend on a daemon being reachable, since an unreachable podman socket
+is exactly the case that produces the most confusing failure downstream. It runs for
+every invocation including `--plan`: which runtime this is does not depend on the
+spec, and a plan podman could never carry out is worse than no plan.
+
 No convergence for a related reason: appliance provisioning is largely
 non-idempotent, and per-dimension state detection is where a reconciler goes subtly
 wrong. Rebuild-from-clean needs none of it, and matches how repro work actually goes.
+
+**Preflight has no side effects, and `--recreate`'s teardown is therefore a
+provisioning command rather than a preflight step.** The ordering that falls out —
+every check passes, *then* the first volume is removed — is what keeps a bad tag or a
+busy port from leaving an operator with a destroyed environment and no replacement.
+It costs one special case: a host port held by one of this project's own containers
+is not a conflict, because it is released before the new environment needs it.
+
+The checks run cheapest-first, and the existing-environment check before the port
+one: a live environment holds the ports it needs, and "port 443 is in use" is a worse
+message than "you already have one of these". `--recreate` itself does not prompt.
+The flag is the confirmation, the destruction is stated in words before it happens,
+and the skill folds that into its single gate — a second prompt would break both
+non-interactive use and that design.
 
 ### Testing
 
@@ -162,6 +185,28 @@ It is not container-*free*: the spec validator is a container by design, so the
 tests build and run that one small image, and `bin/env-test` runs bats itself in a
 container so bats is not a host dependency. Neither needs anything beyond the
 docker daemon the repo already requires.
+
+Because the tests reach `bin/env`'s own functions, the bats image has to resemble a
+host closely enough for them to mean anything. `artifacts/bats/Dockerfile` therefore
+installs GNU grep: busybox grep rejects the long options every real host's grep
+accepts, and under it a guard rail read as *passing* when what actually happened was
+that its `grep` exited 2. Same class of trap on the other side — `_listener_on`
+checks for lsof's `(LISTEN)` column rather than trusting lsof's presence, because
+busybox's lsof ignores the options and lists every open file, which would name a
+random process as the holder of a free port.
+
+The guard-rail tests work by standing in for one seam at a time — `_existing_environment`,
+`_port_holder`, `_runtime_identity`, the registry's answer, or `docker` itself where
+the point is *which* command gets run. Each stub is written inline in the test that
+needs it, so the seam being exercised is visible next to what is asserted about it.
+What that buys is the refusal *messages* — which port, which container, which flag to
+reach for — since a guard rail that fires with an unhelpful message is barely better
+than one that does not fire; and the *ordering*, since a refusal that does not stop
+the run is not a guard rail at all, which is why `_build` is a function rather than
+four lines of entrypoint. What it does not buy is confidence in the lookups
+themselves. Those were checked by hand against a live daemon and registry, bar the
+two cheap enough to assert for real: that a free port reads as free, and that a
+lookup still reaches its fallback on a host missing the tool it would rather use.
 
 Integration testing stays a manual run against a real appliance, as today. The one
 part of verification the fast tests can reach is its failure side: against a
@@ -255,7 +300,11 @@ back into a spec.
 | Validation | JSON Schema, enforced in the YAML-conversion container | The schema is the contract, not documentation that drifts. |
 | Unbuilt topology | Refused by the schema's ranges, not by a check in `bin/env` | Keeps "validates" and "is buildable" one claim, and makes hand-written and generated specs fail identically. |
 | Checks | Preflight plus desired-vs-actual verification | A repro is only useful if the environment really is what the ticket described. |
+| Preflight side effects | None; `--recreate`'s teardown is a provisioning command | Every check passes before the first volume is removed. |
+| `--recreate` confirmation | The flag itself, plus the destruction stated in words | Keeps non-interactive use working, and the skill's single gate the only gate. |
+| Tag resolution | Local image cache first, then the registry under a 30s ceiling | `bin/dap` does not force a pull, so a cached tag needs no VPN; an unbounded TCP timeout is not a fast failure. |
 | Podman | Unsupported, explicitly | Avoids a third fork of drifted provisioning logic. |
+| Podman detection | String-match `DOCKER_HOST`, the server platform and `docker --version` | No single authoritative field, and the check cannot depend on the daemon being up. |
 | Testing | `--plan` plus bats; integration manual | Tests what will regress, without pretending to cover what CI can't reach. |
 | Multi-follower | Pass 2 | Separates the riskiest question from the fiddliest. |
 | KB access | Vendored reference | No path dependency on a single machine's clone. |

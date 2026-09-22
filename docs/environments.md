@@ -51,6 +51,11 @@ Resolved spec:
   followers            0
   sample_data          true
 
+Preflight:
+  1. no environment already exists in this working copy
+  2. host ports 443, 444, 7000 are free
+  3. appliance image registry.tld/conjur-appliance:5.0-stable resolves
+
 Commands:
   1. bin/dap --version 5.0-stable --provision-master
   2. bin/dap --wait-for-master
@@ -70,7 +75,8 @@ Nothing was provisioned (--plan).
 
 `--plan` touches nothing. **Resolved spec** is your spec with every default
 filled in, so you can see what you got by omission as well as what you asked
-for.
+for. **Preflight** is what gets checked before the first command runs — see
+[Preflight](#preflight).
 
 ### 3. Build it
 
@@ -78,13 +84,15 @@ for.
 bin/env environments/examples/single-node.yml
 ```
 
-Runs the commands above in order, then prints the verification table. Expect a
-few minutes, most of it inside `evoke configure master`. When it finishes you
-have a leader at `https://localhost`, account `demo`, user `admin`, password
-`MySecretP@ss1` — the same environment `bin/dap --provision-master` gives you,
-plus the sample policy and secrets.
+Runs the preflight checks, then the commands above in order, then prints the
+verification table. Expect a few minutes, most of it inside
+`evoke configure master`. When it finishes you have a leader at
+`https://localhost`, account `demo`, user `admin`, password `MySecretP@ss1` — the
+same environment `bin/dap --provision-master` gives you, plus the sample policy
+and secrets.
 
-Tear it down with `bin/dap --stop`.
+Tear it down with `bin/dap --stop`, or rebuild it with
+[`--recreate`](#rebuilding-an-environment).
 
 ## Writing a spec
 
@@ -144,6 +152,96 @@ bin/env: the spec was not accepted, so nothing was provisioned.
 
 Constraints live in the schema rather than in `bin/env`, which means a spec you
 hand-wrote fails in exactly the same place as one a tool generated for you.
+
+## Preflight
+
+Three read-only checks run before the first provisioning command, so that an
+environment which cannot come up fails in seconds rather than six minutes into
+`evoke configure master`:
+
+```
+Preflight
+
+  ok  no environment already exists in this working copy
+  ok  host ports 443, 444, 7000 are free
+  ok  appliance image registry.tld/conjur-appliance:5.0-stable resolves (local cache)
+```
+
+**The appliance version has to resolve.** The local image cache is checked
+first — `bin/dap` does not force a pull, so a tag you already have provisions
+without the VPN. Otherwise the registry is asked, and a tag it does not have is
+distinguished from a registry that did not answer:
+
+```
+bin/env: appliance version 13.5 does not resolve as registry.tld/conjur-appliance:13.5.
+bin/env:   the registry answered, and has no such tag. Check the version in the spec.
+bin/env:   A tag already pulled needs neither: docker images | grep conjur-appliance
+```
+
+The registry gets 30 seconds. Off VPN `registry.tld` does not answer at all, and
+without a ceiling that is a TCP timeout rather than a check.
+
+**The host ports have to be free**, because `docker compose` discovers a port it
+cannot bind only after pulling the appliance image:
+
+```
+bin/env: a host port this environment needs is already in use:
+  port 443 is held by container some-other-proxy
+bin/env:   CONJUR_MASTER_PORT moves the leader load balancer off 443; 444 and 7000
+bin/env:   are fixed in docker-compose.yml, so those have to be freed.
+```
+
+A port held by one of *this* project's own containers is not a conflict — those
+are torn down before the new environment needs the port.
+
+**Podman is refused** before the spec is even read. `bin/podman-dap` builds a
+Conjur environment under podman, but it is a drifted fork of `bin/dap` — different
+host ports, no master key encryption, a hardcoded standby count — so a spec
+`bin/env` accepts does not describe what it would build. Use it directly.
+
+## Rebuilding an environment
+
+`bin/env` does not reconcile. Run it against an environment that already exists
+and it refuses rather than half-configuring what is there:
+
+```
+bin/env: an environment already exists in this working copy:
+  conjur-intro-conjur-master-1.mycompany.local-1 (running)
+  conjur-intro-conjur-master.mycompany.local-1 (running)
+bin/env: nothing is reconciled, so this is refused rather than half-configured.
+bin/env:   Rebuild it from clean with --recreate, which destroys its data, its
+bin/env:   replication seeds, its master key and its audit history.
+bin/env:   Or tear it down yourself with bin/dap --stop.
+```
+
+Appliance provisioning is largely non-idempotent, and per-dimension state
+detection is where a reconciler goes subtly wrong. Rebuilding from clean needs
+none of it, and matches how repro work actually goes.
+
+```sh
+bin/env --recreate environments/examples/single-node.yml
+```
+
+`--recreate` makes `bin/dap --stop` the first command in the plan, and says in
+words what that costs before running it:
+
+```
+--recreate destroys the environment already here before building the new one.
+'bin/dap --stop' removes this compose project's volumes, and with them:
+
+  - every policy and secret value loaded into the leader
+  - the replication seeds held for any standby or follower
+  - the master key
+  - the audit database, and the audit history in it
+
+Nothing is backed up first, and none of it can be recovered afterwards. Passing
+--recreate is the confirmation; there is no second prompt.
+```
+
+Passing the flag *is* the confirmation — nothing prompts — so read what
+`bin/env --plan --recreate <spec>` prints if you are unsure. The teardown is a
+provisioning command rather than part of preflight, which is what keeps a failed
+check from leaving you with a destroyed environment and no replacement.
 
 ## Reading the verification table
 
@@ -238,13 +336,12 @@ Also not supported, by design or by not-yet:
 
 - **Transitions.** `events:` is a reserved key, not a feature. Upgrades,
   promotions and triggered failovers are run by hand with `bin/dap`.
-- **Convergence.** There is no reconcile; `bin/env` builds from clean. A
-  destructive-rebuild gate is planned but not shipped, so today it is on you to
-  `bin/dap --stop` first.
-- **Preflight.** Nothing checks up front that the tag resolves or the ports are
-  free, so a bad tag fails partway into a run rather than in seconds.
-- **Podman.** Unsupported on purpose — `bin/podman-dap` is a drifted fork, and a
-  declarative layer over it would misrepresent what it can build.
+- **Convergence.** There is no reconcile, by design: `bin/env` builds from clean
+  and refuses an environment that already exists. See
+  [Rebuilding an environment](#rebuilding-an-environment).
+- **Podman.** Refused on purpose — `bin/podman-dap` is a drifted fork, and a
+  declarative layer over it would misrepresent what it can build. See
+  [Preflight](#preflight).
 - **Authenticators, DR nodes, custom accounts, hostnames and passwords.** All
   outside the spec. See the non-goals in the design doc.
 
@@ -253,10 +350,17 @@ Also not supported, by design or by not-yet:
 **`no such spec: …`** — the path is resolved relative to where you ran the
 command, so a typo or a wrong working directory lands here.
 
-**Provisioning hangs pulling the image.** `registry.tld` is internal and needs
-VPN. If the tag is already in your local image cache it will be used as-is —
-`bin/dap` does not force a pull — so check `docker images | grep conjur-appliance`
-before assuming you need the network.
+**`the registry did not answer within 30s`** — `registry.tld` is internal and
+needs VPN. A tag already in your local image cache is used as-is, so check
+`docker images | grep conjur-appliance` before assuming you need the network.
+
+**`an environment already exists in this working copy`** — expected, and not a
+bug. `bin/env` does not reconcile: rebuild with `--recreate`, or tear the
+environment down with `bin/dap --stop`. Note that stopped leftover containers
+count, because a half-removed environment is not a clean slate either.
+
+**A port conflict you do not recognise.** `lsof -nP -iTCP:443 -sTCP:LISTEN`
+names the holder in full; `bin/env` prints only the first listener it finds.
 
 **Verification mismatches immediately after a successful-looking run.** Most
 often a stale container from an earlier version, which the image-tag row is there
