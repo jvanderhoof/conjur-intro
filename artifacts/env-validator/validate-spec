@@ -82,10 +82,6 @@ def problems(validator, document):
 # so that validating and being buildable stay the same thing; without these
 # hints the operator would see a bare range error and have no idea why.
 NOT_IMPLEMENTED = {
-    "/leader/standbys": "standbys are not provisioned yet",
-    "/leader/auto_failover": (
-        "auto-failover is not provisioned yet; it arrives with standby support"
-    ),
     "/followers": "followers are not provisioned yet",
 }
 
@@ -107,6 +103,28 @@ def hint_for(pointer, message):
             "event sequences (upgrades, promotions, triggered failovers) are a "
             "reserved seam and are not implemented; run them by hand with "
             "bin/dap and see docs/environments.md"
+        )
+
+    # The schema's cross-field rule fires as a bare range error on
+    # /leader/standbys, which says nothing about the field that caused it. Keyed
+    # on the message because the message is all this sees -- so the 2 here has to
+    # stay in step with the `minimum` in the schema's quorum rule.
+    if pointer == "/leader/standbys" and "minimum of 2" in message:
+        return (
+            "auto-failover is an etcd cluster and needs a quorum: a leader plus "
+            "at least 2 standbys, so that losing the leader still leaves a "
+            "majority to elect a new one. Either add standbys or set "
+            "leader.auto_failover: false"
+        )
+
+    # Where the standby ceiling comes from. The number itself is the schema's;
+    # what a bare range error cannot say is that it is the compose file, not
+    # bin/env, that runs out of nodes -- and so what raising it would take.
+    if pointer == "/leader/standbys" and "greater than the maximum" in message:
+        return (
+            "docker-compose.yml defines conjur-master-1 through conjur-master-5, "
+            "so a leader and at most 4 standbys; more would need new compose "
+            "services"
         )
 
     if pointer in NOT_IMPLEMENTED and ("maximum of 0" in message or "expected" in message):

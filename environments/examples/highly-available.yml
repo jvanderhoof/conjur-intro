@@ -1,0 +1,30 @@
+# A leader with two standbys, enrolled in an auto-failover cluster -- the
+# smallest highly available topology, and the one most customer clusters look
+# like.
+#
+#   bin/env --plan environments/examples/highly-available.yml
+#   bin/env environments/examples/highly-available.yml
+#
+# Two standbys is a floor, not a default. Auto-failover is an etcd cluster and
+# elects a new leader by majority: with a leader and one standby, losing the
+# leader leaves one node out of two, so nothing is promoted. The schema refuses
+# fewer than two rather than letting bin/env build a cluster that cannot fail
+# over.
+#
+# Up to four standbys validate -- docker-compose.yml defines conjur-master-1
+# through conjur-master-5 -- and each publishes its own host port: standby 2 on
+# 445, then 446, 447, 448.
+#
+# Quote the version. Unquoted `13.5` is a YAML number, and unquoted `13.10`
+# would silently become 13.1.
+version: "5.0-stable"
+
+leader:
+  standbys: 2
+  auto_failover: true
+
+followers: 0
+
+sample_data: true
+
+# events: []   # reserved seam, deliberately unimplemented -- see the schema

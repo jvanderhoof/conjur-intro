@@ -7,9 +7,10 @@ scope. For how to actually use the thing, see
 **Status:** Partly implemented. The walking skeleton — schema, validation, `--plan`,
 single-leader provisioning, verification and fast tests — is in place, and so are the
 guard rails: preflight, the refusal to reconcile, `--recreate`, and the podman
-refusal. Standbys, auto-failover, followers, the leader-hardening flags and the
-`conjur-env` skill are not. The schema refuses the topology `bin/env` cannot build
-rather than letting it provision something smaller.
+refusal. So are standbys (up to 4) and auto-failover, with the quorum requirement as a
+cross-field schema rule. Followers, the leader-hardening flags and the `conjur-env`
+skill are not. The schema refuses the topology `bin/env` cannot build rather than
+letting it provision something smaller.
 **Date:** 2026-09-22
 **Scope:** Proof of concept. End-to-end first; robustness in later passes.
 
@@ -62,8 +63,8 @@ Only the schema and the sanitized examples are.
 ```yaml
 version: "13.5"          # quoted: unquoted 13.10 is the YAML number 13.1
 leader:
-  standbys: 2            # eventually 0-4; only 0 validates today
-  auto_failover: true    # eventually requires standbys >= 2; only false today
+  standbys: 2            # 0-4, the compose topology's ceiling
+  auto_failover: true    # requires standbys >= 2, for an etcd quorum
   master_key_encryption: true   # not in the schema yet
   custom_certificates: true     # not in the schema yet
   generate_dh: false            # not in the schema yet
@@ -84,16 +85,26 @@ Each field enters the schema as it becomes buildable, so that
 and the reserved `events`; the three leader-hardening flags arrive with the
 ticket that wires them up.
 
-**A field's accepted *range* narrows the same way.** In pass 1 `standbys` and
-`followers` are `maximum: 0` and `auto_failover` is `const: false`, so a spec
-asking for a cluster is rejected by the schema rather than by a conditional in
-`bin/env`. The ceilings rise — `standbys` to 4, `followers` to 1, then beyond —
-as each is actually wired up, and the cross-field rule that auto-failover needs
-at least 2 standbys for a quorum arrives with them. Keeping the refusal in the
-schema is what makes "a spec that validates is a spec that can be provisioned"
-true, and what makes a hand-written spec fail exactly where a generated one
-does. The validator supplies the hint (*"standbys are not provisioned yet"*) that
-a bare range error cannot.
+**A field's accepted *range* widens as `bin/env` learns to build it.** In pass 1
+`standbys` and `followers` were `maximum: 0` and `auto_failover` was
+`const: false`, so a spec asking for a cluster was rejected by the schema rather
+than by a conditional in `bin/env`. `standbys` is now `0-4` — the ceiling is the
+compose file's, which defines `conjur-master-1` through `conjur-master-5` — and
+`auto_failover` is a plain boolean. `followers` is still `maximum: 0`; it rises to
+1, then beyond, when it is wired up. Keeping the refusal in the schema is what
+makes "a spec that validates is a spec that can be provisioned" true, and what
+makes a hand-written spec fail exactly where a generated one does. The validator
+supplies the hint (*"followers are not provisioned yet"*) that a bare range error
+cannot.
+
+**Cross-field rules live there too.** Auto-failover is an etcd cluster and elects
+by majority, so a leader with one standby cannot fail over at all: losing the
+leader leaves one node out of two. The requirement of at least 2 standbys is an
+`if`/`then` in the schema rather than a check in `bin/env`, which means it fires
+before the first standby is seeded, and fires identically for a generated spec. It
+surfaces as a bare `minimum of 2` on `/leader/standbys`, so the validator attaches
+the hint that explains the quorum — a range error cannot name the field that
+caused it.
 
 The version is also pattern-constrained to docker's tag grammar, because it
 reaches a `bin/dap` command line. A spec file is an input, and no value out of
@@ -139,6 +150,21 @@ That way a symbolic tag like `5.0-stable` verifies as cleanly as a pinned one,
 while a stale container left behind by an earlier run still shows up as a
 mismatch. It also reads back one of the sample variables, because "the appliance
 is up" and "the appliance is usable for a repro" are different claims.
+
+The cluster dimensions follow the same principle: count a thing, then check it is
+doing its job. A standby's row is its **replication state** as the leader sees it,
+from `pg_stat_replication` under `/health`, because a standby container that is up
+but not being streamed to is the failure a container count cannot see. Keyed on
+`usename` — the replication role `evoke seed standby <host>` creates, which carries
+the hostname exactly — not on `application_name`, which is an opaque
+`standby_<hex>_<hex>`. Auto-failover gets a row **per cluster member**, read from
+`evoke cluster member list`: `/info` only reports that the leader thinks it is
+clustered, whereas the member list is what etcd actually holds, and it names the node
+that is missing. The **name** is a third row rather than being left implicit in the
+first, because the two probes each answer half of it — `/info` knows the name but not
+who joined, the member list knows who joined but not which cluster they are in — and a
+row whose DESIRED column reads `production` verifies the name in a way that one
+reading `true` only implies.
 
 Podman is out because `bin/podman-dap` is a drifted fork of `bin/dap` — no
 `--standby-count` (it hardcodes 5 standbys), no MKE, no Keycloak, no k8s paths,
@@ -212,6 +238,15 @@ Integration testing stays a manual run against a real appliance, as today. The o
 part of verification the fast tests can reach is its failure side: against a
 stopped environment every dimension must report a mismatch rather than crash or
 pass, which `bin/env` exposes by being sourceable.
+
+Stubbing a probe function tests what `_verify` does with an answer, not whether the
+probe asks the right question, and the replication probe proved that the hard way: a
+filter keyed on `application_name` passed every stubbed test and reported a healthy
+two-standby cluster as `not replicating` on the first live run. The fix came with a
+test one seam lower — `curl` stubbed, the real probe called, against a body the
+appliance actually returned. Where a probe's filter encodes a claim about the
+appliance's JSON, that claim belongs in a test with a captured payload behind it;
+the payload is the part a stub cannot invent.
 
 `--plan` therefore serves two needs at once: it is what makes the
 spec→sequence translation testable, and it is what the skill shows before provisioning.

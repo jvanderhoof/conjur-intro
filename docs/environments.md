@@ -116,14 +116,78 @@ fails loudly instead.
 | Field | Type | Default | Accepted today |
 |---|---|---|---|
 | `version` | string, **required** | — | An appliance image tag, as passed to `bin/dap --version`. Letters, digits, dots, dashes, underscores. |
-| `leader.standbys` | integer | `0` | `0` only — [see below](#not-supported-yet) |
-| `leader.auto_failover` | boolean | `false` | `false` only — [see below](#not-supported-yet) |
+| `leader.standbys` | integer | `0` | `0`–`4` — [see below](#standbys-and-auto-failover) |
+| `leader.auto_failover` | boolean | `false` | `true` needs at least 2 standbys — [see below](#standbys-and-auto-failover) |
 | `followers` | integer | `0` | `0` only — [see below](#not-supported-yet) |
 | `sample_data` | boolean | `true` | Loads the sample policy and variable values via `bin/api --load-sample-policy-and-values`. |
 | `events` | array | — | `[]` only. Reserved seam for transitions (upgrades, promotions, failovers); **not implemented**. |
 
 `sample_data` defaults to `true` because with no policy and no secrets there is
 nothing to reproduce a secret-retrieval issue against.
+
+## Standbys and auto-failover
+
+The smallest highly available spec — a leader, two standbys and an auto-failover
+cluster — is
+[`environments/examples/highly-available.yml`](../environments/examples/highly-available.yml):
+
+```yaml
+version: "5.0-stable"
+
+leader:
+  standbys: 2
+  auto_failover: true
+```
+
+**Two standbys is a floor, not a default.** Auto-failover is an etcd cluster, and
+etcd elects a new leader by majority: with a leader and one standby, losing the
+leader leaves one node out of two, which is not a majority, so nothing is
+promoted. Three members is the smallest configuration that can actually fail
+over. The schema refuses fewer rather than building a cluster that cannot do the
+one thing it was asked for:
+
+```
+bin/env: spec error at /leader/standbys: 1 is less than the minimum of 2
+bin/env:   hint: auto-failover is an etcd cluster and needs a quorum: a leader plus at least 2 standbys, so that losing the leader still leaves a majority to elect a new one. Either add standbys or set leader.auto_failover: false
+bin/env: the spec was not accepted, so nothing was provisioned.
+```
+
+**The ceiling is four standbys**, and it is the compose topology's rather than
+`bin/env`'s — `docker-compose.yml` defines `conjur-master-1` through
+`conjur-master-5`. Asking for more is a schema error, not a failure partway
+through provisioning:
+
+```
+bin/env: spec error at /leader/standbys: 5 is greater than the maximum of 4
+bin/env:   hint: docker-compose.yml defines conjur-master-1 through conjur-master-5, so a leader and at most 4 standbys; more would need new compose services
+```
+
+**Each standby publishes its own host port**, so they join preflight:
+`docker-compose.yml` puts each `conjur-master` node on 443 plus its number, which
+makes the leader 444 and the standbys 445, 446, 447, 448. A two-standby spec
+checks `443, 444, 445, 446, 7000`.
+
+The order matters, and `bin/env` knows it — the leader has to be configured with
+the standbys' hostnames in its certificate before any standby can be seeded, so
+the standby count is passed to `--provision-master` as well:
+
+```
+Commands:
+  1. bin/dap --version 5.0-stable --standby-count 2 --provision-master
+  2. bin/dap --wait-for-master
+  3. bin/dap --standby-count 2 --provision-standbys
+  4. bin/dap --standby-count 2 --enable-auto-failover
+  5. bin/api --load-sample-policy-and-values
+```
+
+Expect 10–20 minutes for a two-standby cluster, most of it in
+`evoke configure master` and the standby seeds.
+
+**Enabling auto-failover dirties your working tree.** `bin/dap
+--enable-auto-failover` rewrites the tracked `policy/cluster.yml` to list the
+cluster's members, so `git status` shows it modified after the run. That is
+`bin/dap`'s behaviour, not `bin/env`'s; `git checkout policy/cluster.yml` once
+the environment is up.
 
 ## The schema is the contract
 
@@ -187,8 +251,9 @@ cannot bind only after pulling the appliance image:
 ```
 bin/env: a host port this environment needs is already in use:
   port 443 is held by container some-other-proxy
-bin/env:   CONJUR_MASTER_PORT moves the leader load balancer off 443; 444 and 7000
-bin/env:   are fixed in docker-compose.yml, so those have to be freed.
+bin/env:   CONJUR_MASTER_PORT moves the leader load balancer off 443. The appliance
+bin/env:   ports -- 444 for the leader, then 445 up, one per standby -- and 7000 are
+bin/env:   fixed in docker-compose.yml, so those have to be freed.
 ```
 
 A port held by one of *this* project's own containers is not a conflict — those
@@ -251,14 +316,14 @@ against what you asked for. Any mismatch exits non-zero. A successful run:
 ```
 Verification
 
-  DIMENSION            DESIRED          ACTUAL           RESULT
-  leader health        ok               ok               ok
-  leader /info         reported         reported         ok
-  leader image tag     5.0-stable       5.0-stable       ok
-  standbys running     0                0                ok
-  followers running    0                0                ok
-  auto-failover        false            false            ok
-  sample data          loaded           loaded           ok
+  DIMENSION              DESIRED          ACTUAL           RESULT
+  leader health          ok               ok               ok
+  leader /info           reported         reported         ok
+  leader image tag       5.0-stable       5.0-stable       ok
+  standbys running       0                0                ok
+  followers running      0                0                ok
+  auto-failover          false            false            ok
+  sample data            loaded           loaded           ok
 
 The environment matches the spec.
 Conjur is available at: 'https://localhost:443'
@@ -270,16 +335,38 @@ mode looks like at once:
 ```
 Verification
 
-  DIMENSION            DESIRED          ACTUAL           RESULT
-  leader health        ok               unreachable      MISMATCH
-  leader /info         reported         no               MISMATCH
-  leader image tag     5.0-stable       not running      MISMATCH
-  standbys running     0                0                ok
-  followers running    0                0                ok
-  auto-failover        false            unknown          MISMATCH
-  sample data          loaded           not retrievable  MISMATCH
+  DIMENSION              DESIRED          ACTUAL           RESULT
+  leader health          ok               unreachable      MISMATCH
+  leader /info           reported         no               MISMATCH
+  leader image tag       5.0-stable       not running      MISMATCH
+  standbys running       0                0                ok
+  followers running      0                0                ok
+  auto-failover          false            unreachable      MISMATCH
+  sample data            loaded           not retrievable  MISMATCH
 
 bin/env: the environment does not match the spec.
+```
+
+A spec with standbys adds a row per standby, and one per cluster member when
+auto-failover is on:
+
+```
+Verification
+
+  DIMENSION              DESIRED          ACTUAL           RESULT
+  leader health          ok               ok               ok
+  leader /info           reported         reported         ok
+  leader image tag       5.0-stable       5.0-stable       ok
+  standbys running       2                2                ok
+  standby 2 replication  streaming        streaming        ok
+  standby 3 replication  streaming        streaming        ok
+  followers running      0                0                ok
+  auto-failover          true             true             ok
+  cluster name           production       production       ok
+  cluster member 1       enrolled         enrolled         ok
+  cluster member 2       enrolled         enrolled         ok
+  cluster member 3       enrolled         enrolled         ok
+  sample data            loaded           loaded           ok
 ```
 
 What the dimensions mean:
@@ -297,8 +384,30 @@ What the dimensions mean:
   container left behind by an earlier run shows up as a mismatch.
 - **standbys running** / **followers running** — counted from the running
   containers, not assumed from the spec.
-- **auto-failover** — read from the cluster name under `/info`, the same way the
-  rest of `bin/dap` detects a cluster.
+- **standby N replication** — the leader's own view of that standby, read from
+  `pg_stat_replication` under `/health`. The desired state is `streaming`: caught
+  up and receiving WAL. `not replicating` means the container is up but the leader
+  is not shipping to it at all, which is the failure a container count cannot see —
+  a standby that is only running is not a standby. Any other postgres state is
+  reported as postgres names it rather than flattened to a yes/no, so `catchup` —
+  connected but still replaying the backlog — reads as a mismatch showing
+  `catchup`. That is deliberate: `bin/dap` waits for synchronous replication before
+  it returns, so a standby still catching up at verification time is a real finding,
+  and the distinction between "behind" and "not connected" is the first thing you
+  want to know.
+- **auto-failover** — whether the leader is clustered at all, read from the cluster
+  name under `/info`, the same way the rest of `bin/dap` detects a cluster. A
+  cluster under an unexpected name is reported as `cluster <name>` rather than
+  folded into `false`.
+- **cluster name** — the same probe, stated as a name: `production` is the only
+  cluster `bin/dap` enrols, and the spec has no field to override it. It gets its
+  own row because the membership rows below cannot say it — etcd is asked which
+  nodes are in the cluster it holds, not which cluster that is. Only shown when
+  `auto_failover` is true.
+- **cluster member N** — each node's membership in the cluster, read from
+  `evoke cluster member list` on the leader. `/info` says the leader thinks it is
+  clustered; this says etcd agrees about every node, and names the one that is
+  `missing`. Only shown when `auto_failover` is true.
 - **sample data** — a known sample secret is fetched back. Only shown when
   `sample_data` is true. `"the appliance is up"` and `"the appliance is usable
   for a repro"` are different claims, and this is the one that matters.
@@ -318,8 +427,8 @@ schema and the sanitized examples are tracked. If you add an example, sanitize i
 
 ## Not supported yet
 
-Standbys, auto-failover and followers are **refused by the schema**, rather than
-quietly built smaller than you asked for:
+Followers are **refused by the schema**, rather than quietly built smaller than
+you asked for:
 
 ```
 bin/env: spec error at /followers: 1 is greater than the maximum of 0
@@ -329,8 +438,7 @@ bin/env: the spec was not accepted, so nothing was provisioned.
 
 Each field's ceiling rises as `bin/env` learns to build it, so "this spec
 validates" and "this spec can be provisioned" stay the same claim. Until then,
-use `bin/dap --provision-standbys`, `--enable-auto-failover` and
-`--provision-follower` by hand.
+use `bin/dap --provision-follower` by hand.
 
 Also not supported, by design or by not-yet:
 
@@ -373,6 +481,22 @@ certificate genuinely does not exist at that point in `evoke configure master`,
 and it is generated a few steps later. They come from the appliance, not from
 `bin/env`, and a run that ends with `Configuration successful` was fine. Trust
 the verification table over anything in the middle.
+
+**`standby N replication … not replicating`** — the container is up but the
+leader is not streaming to it. `bin/dap --standby-count N --provision-standbys`
+seeds standbys from the leader, so this usually means the seed or
+`evoke replication sync start` did not complete for that node. The leader's own
+view is the authority: `curl -sk https://localhost:444/health | jq
+'.database.replication_status.pg_stat_replication'`.
+
+**`cluster member N … missing`** — the node is not in etcd's member list even
+though the leader reports a cluster. `docker compose exec
+conjur-master-1.mycompany.local evoke cluster member list` shows what etcd
+actually holds.
+
+**`policy/cluster.yml` shows as modified after an auto-failover run.** Expected.
+`bin/dap --enable-auto-failover` rewrites it with the cluster's members;
+`git checkout policy/cluster.yml` to drop it.
 
 **A spec validates but provisioning fails.** That gap is the interesting one —
 the schema is meant to make it impossible. Worth reporting rather than working

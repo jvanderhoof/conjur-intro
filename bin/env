@@ -43,6 +43,11 @@ REGISTRY_TIMEOUT_SECONDS=30
 SAMPLE_SECRET='staging/my-app-1/postgres-database/password'
 SAMPLE_SECRET_VALUE='secret-p@ssword-staging-my-app-1'
 
+# The only auto-failover cluster bin/dap enrols. Named here because verification
+# checks for it and the spec has no field to override it: `auto_failover: true`
+# means this cluster.
+CLUSTER_NAME='production'
+
 function _print_help {
   cat << EOF
 
@@ -63,7 +68,8 @@ Usage: bin/env [options] <spec>
 
 The spec is a YAML file validated against $SCHEMA; an unknown or
 misspelled key, or a topology bin/env cannot build, is a hard error naming the
-offending field. Start from environments/examples/single-node.yml.
+offending field. Start from environments/examples/single-node.yml, or
+environments/examples/highly-available.yml for a leader with standbys.
 
 Nothing is reconciled. If an environment already exists in this working copy,
 bin/env refuses rather than half-configuring it; rebuild with --recreate, or
@@ -75,9 +81,10 @@ Specs written directly into environments/ are gitignored. This repo is mirrored
 to the public conjurdemos GitHub org, so customer hostnames and admin passwords
 must never end up in a tracked file.
 
-Standbys, auto-failover and followers are not provisioned yet, so the schema
-rejects them rather than letting bin/env quietly build something smaller. Set
-them up with bin/dap by hand until then.
+Up to 4 standbys can be provisioned, optionally enrolled in an auto-failover
+cluster -- which needs at least 2 of them to hold a quorum. Followers are not
+provisioned yet, so the schema rejects them rather than letting bin/env quietly
+build something smaller; set those up with bin/dap by hand until then.
 
 Podman is not supported: use bin/podman-dap directly.
 
@@ -251,15 +258,45 @@ function _refuse_existing_environment {
   exit 1
 }
 
+### Topology
+
+# docker-compose.yml names the appliance nodes conjur-master-1 through
+# conjur-master-5. Here rather than inline so that the one place a node number
+# becomes a hostname is the one place to change if the naming ever does.
+function _node_host {
+  echo "conjur-master-$1.mycompany.local"
+}
+
+# The standbys the spec asked for, by node number. The leader is node 1, so
+# standbys run from 2 to one past the count -- arithmetic that every loop over the
+# standbys would otherwise repeat, and that is off by one in either direction if it
+# is got wrong.
+function _standby_numbers {
+  local number
+
+  for (( number = 2; number <= SPEC_STANDBYS + 1; number++ )); do
+    echo "$number"
+  done
+}
+
 ### Host ports
 
 # The host ports the planned topology binds. docker compose fails on a port it
 # cannot bind, and it fails only after pulling the appliance image, so this is
-# worth knowing up front. Standby and follower ports join the list as those
-# topologies become buildable.
+# worth knowing up front. Follower ports join the list as that topology becomes
+# buildable.
 function _required_ports {
+  local number
+
   echo "$CONJUR_MASTER_PORT"  # the leader load balancer
   echo 444                    # the leader appliance, published directly
+
+  # docker-compose.yml publishes each conjur-master node on 443 plus its number,
+  # so the leader is on 444 and the standbys follow it.
+  for number in $(_standby_numbers); do
+    echo $((443 + number))
+  done
+
   echo 7000                   # the leader load balancer's stats page
 }
 
@@ -392,8 +429,9 @@ function _refuse_ports {
 
   echo 'bin/env: a host port this environment needs is already in use:' >&2
   printf '%s' "$conflicts" >&2
-  echo 'bin/env:   CONJUR_MASTER_PORT moves the leader load balancer off 443; 444 and 7000' >&2
-  echo 'bin/env:   are fixed in docker-compose.yml, so those have to be freed.' >&2
+  echo 'bin/env:   CONJUR_MASTER_PORT moves the leader load balancer off 443. The appliance' >&2
+  echo 'bin/env:   ports -- 444 for the leader, then 445 up, one per standby -- and 7000 are' >&2
+  echo 'bin/env:   fixed in docker-compose.yml, so those have to be freed.' >&2
   exit 1
 }
 
@@ -485,18 +523,59 @@ function _preflight_descriptions {
 # of the spec-to-sequence translation, which is why --plan is both what the
 # tests assert and what the skill shows before provisioning.
 function _provision_commands {
+  local -a leader
+
   # A clean rebuild rather than a reconcile, and a provisioning command rather
   # than part of preflight, so that every check has passed before any data goes.
   if [[ "$RECREATE" == true ]]; then
     echo 'bin/dap --stop'
   fi
 
-  echo "bin/dap --version $SPEC_VERSION --provision-master"
+  # bin/dap defaults to two standbys, and its default reaches further than the
+  # standby commands: `evoke configure master` takes the standby hostnames as
+  # certificate altnames, so the leader has to be provisioned with the count the
+  # spec asked for or it issues a certificate the standbys cannot be reached on.
+  #
+  # The count is passed only when the spec asks for standbys. With none, bin/dap's
+  # own default produces the leader certificate that single-node environments
+  # already verify against, and `--standby-count 0` would instead hand
+  # `evoke configure master` a trailing comma in its altname list.
+  leader=(bin/dap --version "$SPEC_VERSION")
+  if (( SPEC_STANDBYS > 0 )); then
+    leader+=(--standby-count "$SPEC_STANDBYS")
+  fi
+  echo "${leader[*]} --provision-master"
 
   # bin/dap returns as soon as `evoke configure master` does, which is before
   # the appliance serves traffic. Everything after this point needs a healthy
   # leader.
   echo 'bin/dap --wait-for-master'
+
+  # Brings each standby up, seeds it from the leader, starts synchronous
+  # replication, and swaps the leader load balancer onto its multi-node
+  # configuration. bin/dap waits for the leader again at the end of it.
+  #
+  # --version again, and not for tidiness: bin/dap passes it to compose as
+  # VERSION, and every conjur-master service resolves its image from that. A step
+  # that brings a container up without it gets bin/dap's own default tag, so the
+  # spec's version would reach the leader and 5.0-stable would reach the standbys.
+  if (( SPEC_STANDBYS > 0 )); then
+    echo "bin/dap --version $SPEC_VERSION --standby-count $SPEC_STANDBYS --provision-standbys"
+  fi
+
+  # Enrolment needs every node it is about to enrol to be up, so it follows the
+  # standbys. It loads policy of its own -- the root policy and the cluster's --
+  # which is why the sample data goes in after it rather than before: the
+  # retrievability check then speaks for the finished cluster rather than for the
+  # leader it started as.
+  #
+  # No --version here: enrolment only execs into containers that are already up,
+  # and loads policy through the pinned CLI image, so it never resolves an
+  # appliance tag. The count is unconditional because the schema will not accept
+  # auto-failover without at least two standbys.
+  if [[ "$SPEC_AUTO_FAILOVER" == true ]]; then
+    echo "bin/dap --standby-count $SPEC_STANDBYS --enable-auto-failover"
+  fi
 
   if [[ "$SPEC_SAMPLE_DATA" == true ]]; then
     echo 'bin/api --load-sample-policy-and-values'
@@ -504,12 +583,28 @@ function _provision_commands {
 }
 
 function _check_descriptions {
+  local number
+
   echo 'leader /health reports ok'
   echo 'leader /info reports its configuration'
   echo "leader image tag is $SPEC_VERSION"
   echo "standbys running is $SPEC_STANDBYS"
+
+  for number in $(_standby_numbers); do
+    echo "standby $number is replicating from the leader"
+  done
+
   echo "followers running is $SPEC_FOLLOWERS"
   echo "auto-failover configured is $SPEC_AUTO_FAILOVER"
+
+  # The leader is enrolled alongside its standbys, hence node 1 as well.
+  if [[ "$SPEC_AUTO_FAILOVER" == true ]]; then
+    echo "cluster name is $CLUSTER_NAME"
+
+    for number in 1 $(_standby_numbers); do
+      echo "$(_node_host "$number") is enrolled in the $CLUSTER_NAME cluster"
+    done
+  fi
 
   if [[ "$SPEC_SAMPLE_DATA" == true ]]; then
     echo "sample secret $SAMPLE_SECRET is retrievable"
@@ -647,10 +742,44 @@ function _leader_info_state {
 
 function _auto_failover_state {
   case "$1" in
-    production ) echo 'true' ;;
+    "$CLUSTER_NAME" ) echo 'true' ;;
     none ) echo 'false' ;;
-    * ) echo 'unknown' ;;
+    unreachable | unparseable ) echo "$1" ;;
+    # Enrolled, but not in the cluster bin/dap builds. The name is what the
+    # operator has to reconcile, so print it rather than the word `unknown`.
+    * ) echo "cluster $1" ;;
   esac
+}
+
+# The names etcd knows the auto-failover cluster's members by, one per line.
+# `evoke cluster member list` prints etcd's own member list as JSON, and the
+# machine names bin/dap enrols are the node hostnames.
+#
+# No output when there is no cluster, or when its etcd cannot answer. Both mean
+# nothing is enrolled as far as verification is concerned, which is the truthful
+# reading: a cluster that cannot report its members cannot fail over either.
+#
+# stdin is closed explicitly because `docker compose exec` forwards it, and a
+# command that drains bin/env's stdin has already cost this script one silent bug.
+function _cluster_member_names {
+  docker compose exec -T "$(_node_host 1)" \
+    evoke cluster member list < /dev/null 2> /dev/null \
+    | jq --raw-output '.[].name' 2> /dev/null || true
+}
+
+# Whether one node is in the member list, which is a different question from
+# whether it is running: enrolment is per node and can fail for one of them.
+function _cluster_membership_state {
+  local host
+  local members="$2"
+
+  host="$(_node_host "$1")"
+
+  if grep --quiet --fixed-strings --line-regexp "$host" <<< "$members"; then
+    echo 'enrolled'
+  else
+    echo 'missing'
+  fi
 }
 
 # The tag the leader is actually running, which is what the spec asked for. This
@@ -662,7 +791,7 @@ function _leader_image_tag {
   local container
   local image
 
-  container="$(docker compose ps --quiet conjur-master-1.mycompany.local 2> /dev/null || true)"
+  container="$(docker compose ps --quiet "$(_node_host 1)" 2> /dev/null || true)"
   if [[ -z "$container" ]]; then
     echo 'not running'
     return
@@ -677,13 +806,34 @@ function _leader_image_tag {
   echo "${image##*:}"
 }
 
+# Whether one standby is actually receiving WAL from the leader, which is a
+# different question from whether its container is up.
+#
+# The leader's /health carries a pg_stat_replication row per attached replica, and
+# there is no `evoke replication status` to ask instead, so the leader's own view
+# is the source. A standby that has stopped replicating is simply absent from that
+# list rather than present and unhealthy, so absence is the case worth naming.
+function _standby_replication_state {
+  local host
+  host="$(_node_host "$1")"
+
+  # Keyed on usename, which is the replication role `evoke seed standby $host ...`
+  # creates and so carries the standby's hostname exactly. Not application_name:
+  # that is an opaque `standby_<hex>_<hex>` with no hostname in it at all, and
+  # keying on it reports a healthy cluster as not replicating.
+  _leader_probe 'health' "
+    [ (.database.replication_status.pg_stat_replication // [])[]
+      | select((.usename // \"\") == \"$host\") ]
+    | if length == 0 then \"not replicating\" else (.[0].state // \"unknown\") end"
+}
+
 function _running_standbys {
   local count=0
   local number
 
   # The leader is conjur-master-1, so standbys start at 2.
   for number in 2 3 4 5; do
-    if [[ -n "$(docker compose ps --quiet --status running "conjur-master-$number.mycompany.local" 2> /dev/null)" ]]; then
+    if [[ -n "$(docker compose ps --quiet --status running "$(_node_host "$number")" 2> /dev/null)" ]]; then
       count=$((count + 1))
     fi
   done
@@ -728,13 +878,16 @@ function _check {
     VERIFY_MISMATCHED=true
   fi
 
-  # 16 wide because `not retrievable` is the longest value either column holds;
-  # a narrower column shifts RESULT right and the table stops scanning cleanly.
-  VERIFY_ROWS+="$(printf '  %-20s %-16s %-16s %s' "$dimension" "$desired" "$actual" "$result")"$'\n'
+  # 22 wide because `standby 4 replication` is the longest dimension, 16 because
+  # `not retrievable` is the longest value either middle column holds; narrower
+  # columns shift RESULT right and the table stops scanning cleanly.
+  VERIFY_ROWS+="$(printf '  %-22s %-16s %-16s %s' "$dimension" "$desired" "$actual" "$result")"$'\n'
 }
 
 function _verify {
   local cluster_name
+  local members
+  local number
 
   VERIFY_ROWS=''
   VERIFY_MISMATCHED=false
@@ -749,14 +902,45 @@ function _verify {
   _check 'leader /info' 'reported' "$(_leader_info_state "$cluster_name")"
   _check 'leader image tag' "$SPEC_VERSION" "$(_leader_image_tag)"
   _check 'standbys running' "$SPEC_STANDBYS" "$(_running_standbys)"
+
+  # Per standby rather than in aggregate: a cluster where one node is up but no
+  # longer replicating is exactly the state a count cannot see, and the node
+  # number is what the operator needs to go and look at.
+  for number in $(_standby_numbers); do
+    _check "standby $number replication" 'streaming' "$(_standby_replication_state "$number")"
+  done
+
   _check 'followers running' "$SPEC_FOLLOWERS" "$(_running_followers)"
+
+  # Whether the leader is clustered at all, as the spec's own true/false: any name
+  # other than the one bin/dap enrols is reported as itself rather than folded into
+  # a pass.
   _check 'auto-failover' "$SPEC_AUTO_FAILOVER" "$(_auto_failover_state "$cluster_name")"
+
+  # The name on its own row as well, because the membership rows below cannot say
+  # it: etcd is asked which nodes are in the cluster it holds, not which cluster
+  # that is. Stating the expected name is the difference between a table that
+  # verifies it and one that leaves the reader to infer it from `true`.
+  #
+  # Membership itself is read from etcd rather than inferred from the leader
+  # answering. A leader is healthy whether or not its standbys ever joined, and a
+  # cluster that is a member short fails over to one fewer node than the spec
+  # described.
+  if [[ "$SPEC_AUTO_FAILOVER" == true ]]; then
+    _check 'cluster name' "$CLUSTER_NAME" "$cluster_name"
+
+    members="$(_cluster_member_names)"
+
+    for number in 1 $(_standby_numbers); do
+      _check "cluster member $number" 'enrolled' "$(_cluster_membership_state "$number" "$members")"
+    done
+  fi
 
   if [[ "$SPEC_SAMPLE_DATA" == true ]]; then
     _check 'sample data' 'loaded' "$(_sample_data_state)"
   fi
 
-  printf '  %-20s %-16s %-16s %s\n' 'DIMENSION' 'DESIRED' 'ACTUAL' 'RESULT'
+  printf '  %-22s %-16s %-16s %s\n' 'DIMENSION' 'DESIRED' 'ACTUAL' 'RESULT'
   printf '%s' "$VERIFY_ROWS"
   echo
 

@@ -21,16 +21,15 @@
       "default": {},
       "properties": {
         "standbys": {
-          "description": "Number of standbys to deploy alongside the leader. Only 0 validates today, because bin/env does not provision standbys yet. The ceiling rises to 4 -- the number of conjur-master services docker-compose.yml defines -- when it does.",
+          "description": "Number of standbys to deploy alongside the leader. The ceiling is the compose topology's: docker-compose.yml defines conjur-master-1 through conjur-master-5, so a leader and at most 4 standbys. More would need new compose services, so it is refused here rather than failing partway through provisioning.",
           "type": "integer",
           "minimum": 0,
-          "maximum": 0,
+          "maximum": 4,
           "default": 0
         },
         "auto_failover": {
-          "description": "Enrol the leader and its standbys in an auto-failover cluster. Only false validates today. Auto-failover, and the constraint that it needs at least 2 standbys to hold a quorum, arrive together with standby support.",
+          "description": "Enrol the leader and its standbys in an auto-failover cluster named `production`. Requires at least 2 standbys, which the cross-field rule below enforces.",
           "type": "boolean",
-          "const": false,
           "default": false
         }
       }
@@ -52,5 +51,33 @@
       "type": "array",
       "maxItems": 0
     }
-  }
+  },
+  "allOf": [
+    {
+      "title": "auto-failover needs a quorum",
+      "description": "Auto-failover is an etcd cluster, and an etcd cluster elects a new leader by majority vote: with a leader and one standby, losing the leader leaves one node out of two, which is not a majority, so nothing is promoted. Three members is the smallest configuration that can fail over, which means at least 2 standbys. This is a cross-field rule rather than a check in bin/env so that a hand-written spec hits it exactly where a generated one does -- and hits it before the first standby is provisioned.",
+      "if": {
+        "type": "object",
+        "required": ["leader"],
+        "properties": {
+          "leader": {
+            "type": "object",
+            "required": ["auto_failover"],
+            "properties": {
+              "auto_failover": { "const": true }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "leader": {
+            "properties": {
+              "standbys": { "minimum": 2 }
+            }
+          }
+        }
+      }
+    }
+  ]
 }

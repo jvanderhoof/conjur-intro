@@ -76,6 +76,17 @@ bin/dap --wait-for-master
 bin/api --load-sample-policy-and-values' ]
 }
 
+@test "the tracked highly-available example plans a leader, two standbys and a cluster" {
+  run bin/env --plan environments/examples/highly-available.yml
+
+  [ "$status" -eq 0 ]
+  [ "$(plan_commands)" = 'bin/dap --version 5.0-stable --standby-count 2 --provision-master
+bin/dap --wait-for-master
+bin/dap --version 5.0-stable --standby-count 2 --provision-standbys
+bin/dap --standby-count 2 --enable-auto-failover
+bin/api --load-sample-policy-and-values' ]
+}
+
 @test "plan mode reports the defaults it filled in" {
   spec 'version: "13.5"'
 
@@ -104,6 +115,54 @@ bin/api --load-sample-policy-and-values' ]
   [[ "$(plan_checks)" == *'staging/my-app-1/postgres-database/password is retrievable'* ]]
 }
 
+@test "standbys are provisioned after the leader, and the leader is told how many" {
+  spec 'version: "13.5"' 'leader:' '  standbys: 2'
+
+  run bin/env --plan "$SPEC"
+
+  [ "$status" -eq 0 ]
+
+  # --standby-count is on the leader command as well as the standby one, and not
+  # for symmetry: `evoke configure master` takes the standby hostnames as
+  # certificate altnames, so a leader provisioned without them issues a
+  # certificate the standbys cannot be reached on.
+  [ "$(plan_commands)" = 'bin/dap --version 13.5 --standby-count 2 --provision-master
+bin/dap --wait-for-master
+bin/dap --version 13.5 --standby-count 2 --provision-standbys
+bin/api --load-sample-policy-and-values' ]
+}
+
+# bin/dap passes --version through to compose as VERSION, and every conjur-master
+# service resolves its image from it. --provision-standbys starts containers, so a
+# standbys command without the version gets bin/dap's own default rather than the
+# spec's: a 13.5 leader with 5.0-stable standbys, which nothing downstream would
+# report.
+@test "standbys are provisioned from the version in the spec, not bin/dap's default" {
+  spec 'version: "13.5"' 'leader:' '  standbys: 2' '  auto_failover: true'
+
+  run bin/env --plan "$SPEC"
+
+  [ "$status" -eq 0 ]
+  [[ "$(plan_commands)" == *'bin/dap --version 13.5 --standby-count 2 --provision-standbys'* ]]
+}
+
+@test "auto-failover enrols the cluster once the standbys are replicating" {
+  spec 'version: "13.5"' 'leader:' '  standbys: 2' '  auto_failover: true'
+
+  run bin/env --plan "$SPEC"
+
+  [ "$status" -eq 0 ]
+
+  # Enrolment last but for the sample data: it needs every node it will enrol to
+  # be up, and it loads cluster policy of its own, so the sample data goes in
+  # afterwards and the retrievability check then speaks for the finished cluster.
+  [ "$(plan_commands)" = 'bin/dap --version 13.5 --standby-count 2 --provision-master
+bin/dap --wait-for-master
+bin/dap --version 13.5 --standby-count 2 --provision-standbys
+bin/dap --standby-count 2 --enable-auto-failover
+bin/api --load-sample-policy-and-values' ]
+}
+
 @test "disabling sample data drops both loading it and checking it" {
   spec 'version: "13.5"' 'sample_data: false'
 
@@ -124,6 +183,38 @@ bin/dap --wait-for-master' ]
   [[ "$(plan_preflight)" == *'no environment already exists'* ]]
   [[ "$(plan_preflight)" == *'host ports 443, 444, 7000 are free'* ]]
   [[ "$(plan_preflight)" == *'registry.tld/conjur-appliance:13.5 resolves'* ]]
+}
+
+@test "plan mode lists the cluster checks, per standby and per cluster member" {
+  spec 'version: "13.5"' 'leader:' '  standbys: 2' '  auto_failover: true'
+
+  run bin/env --plan "$SPEC"
+
+  [ "$status" -eq 0 ]
+  [[ "$(plan_checks)" == *'standbys running is 2'* ]]
+  [[ "$(plan_checks)" == *'standby 2 is replicating from the leader'* ]]
+  [[ "$(plan_checks)" == *'standby 3 is replicating from the leader'* ]]
+  [[ "$(plan_checks)" == *'conjur-master-1.mycompany.local is enrolled in the production cluster'* ]]
+  [[ "$(plan_checks)" == *'conjur-master-3.mycompany.local is enrolled in the production cluster'* ]]
+}
+
+@test "plan mode lists no cluster membership check without auto-failover" {
+  spec 'version: "13.5"' 'leader:' '  standbys: 2'
+
+  run bin/env --plan "$SPEC"
+
+  [ "$status" -eq 0 ]
+  [[ "$(plan_checks)" == *'standby 2 is replicating from the leader'* ]]
+  [[ "$(plan_checks)" != *'enrolled'* ]]
+}
+
+@test "each standby's own host port is part of preflight" {
+  spec 'version: "13.5"' 'leader:' '  standbys: 2'
+
+  run bin/env --plan "$SPEC"
+
+  [ "$status" -eq 0 ]
+  [[ "$(plan_preflight)" == *'host ports 443, 444, 445, 446, 7000 are free'* ]]
 }
 
 @test "recreate plans a teardown first and says plainly what that destroys" {
@@ -304,32 +395,76 @@ bin/api --load-sample-policy-and-values' ]
 }
 
 #
-## Topology this pass cannot build yet
+## The leader cluster -- how far the schema lets a spec go
 #
-# The schema's ceilings, not a conditional in bin/env, are what refuse these --
-# so a hand-written spec fails exactly where a generated one does, and never
-# gets far enough to build something smaller than it asked for.
+# The compose topology defines conjur-master-1 through 5, so a leader and at most
+# four standbys. The ceiling is the schema's, not a conditional in bin/env, so a
+# hand-written spec fails exactly where a generated one does -- and it fails
+# before anything is provisioned rather than halfway through a standby.
 
-@test "standbys are refused by the schema, naming the pointer" {
-  spec 'version: "13.5"' 'leader:' '  standbys: 2'
+@test "a standby count above what the compose topology defines is a schema error" {
+  spec 'version: "13.5"' 'leader:' '  standbys: 5'
 
   run bin/env --plan "$SPEC"
 
   [ "$status" -ne 0 ]
   [[ "$output" == *'/leader/standbys'* ]]
-  [[ "$output" == *'standbys are not provisioned yet'* ]]
+  [[ "$output" == *'maximum of 4'* ]]
+  [[ "$output" == *'docker-compose.yml'* ]]
   [[ "$output" == *'nothing was provisioned'* ]]
 }
 
-@test "auto-failover is refused by the schema" {
+@test "the largest standby count the compose topology supports validates" {
+  spec 'version: "13.5"' 'leader:' '  standbys: 4'
+
+  run bin/env --plan "$SPEC"
+
+  [ "$status" -eq 0 ]
+}
+
+@test "auto-failover with one standby is refused, and the message says why" {
+  spec 'version: "13.5"' 'leader:' '  standbys: 1' '  auto_failover: true'
+
+  run bin/env --plan "$SPEC"
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *'/leader/standbys'* ]]
+  [[ "$output" == *'quorum'* ]]
+  [[ "$output" == *'nothing was provisioned'* ]]
+}
+
+@test "auto-failover on its own is refused rather than taking the standby default" {
+  # leader.standbys defaults to 0, so this spec asks for a cluster of one, which
+  # can never elect anything. The cross-field rule is what catches it.
   spec 'version: "13.5"' 'leader:' '  auto_failover: true'
 
   run bin/env --plan "$SPEC"
 
   [ "$status" -ne 0 ]
-  [[ "$output" == *'/leader/auto_failover'* ]]
-  [[ "$output" == *'auto-failover is not provisioned yet'* ]]
+  [[ "$output" == *'quorum'* ]]
 }
+
+@test "auto-failover with two standbys validates" {
+  spec 'version: "13.5"' 'leader:' '  standbys: 2' '  auto_failover: true'
+
+  run bin/env --plan "$SPEC"
+
+  [ "$status" -eq 0 ]
+}
+
+@test "the quorum rule does not fire when auto-failover is off" {
+  spec 'version: "13.5"' 'leader:' '  standbys: 1'
+
+  run bin/env --plan "$SPEC"
+
+  [ "$status" -eq 0 ]
+}
+
+#
+## Topology this pass cannot build yet
+#
+# Same mechanism as the ceiling above, for a dimension that has no supported
+# range at all yet.
 
 @test "a follower is refused by the schema" {
   spec 'version: "13.5"' 'followers: 1'
@@ -832,6 +967,200 @@ bin/api --load-sample-policy-and-values' ]
   # these two rows are the only ones that agree.
   [[ "$(rows)" == *'standbys running 0 0 ok'* ]]
   [[ "$(rows)" == *'followers running 0 0 ok'* ]]
+}
+
+# The probe itself, rather than a stub of it, because the trap this catches is in
+# the jq filter. The body below is one the appliance really returned for a
+# two-standby cluster: pg_stat_replication names the standby in `usename` -- the
+# replication role `evoke seed standby <host>` creates for it -- while
+# `application_name` is an opaque `standby_<hex>_<hex>` with no hostname in it.
+# The seam is curl, which is the boundary this probe actually has.
+@test "replication state is read from the leader's own view of each standby" {
+  BIN_ENV_SOURCE_ONLY=1 source bin/env
+
+  curl() {
+    cat <<'JSON'
+{
+  "ok": true,
+  "database": {
+    "replication_status": {
+      "pg_stat_replication": [
+        {
+          "usename": "conjur-master-2.mycompany.local",
+          "application_name": "standby_af7a67_d2558d33014e",
+          "client_hostname": "conjur-intro-conjur-master-2.mycompany.local-1.dap_net",
+          "state": "streaming",
+          "sync_state": "sync"
+        },
+        {
+          "usename": "conjur-master-3.mycompany.local",
+          "application_name": "standby_f5f31e_71aca651338b",
+          "client_hostname": "conjur-intro-conjur-master-3.mycompany.local-1.dap_net",
+          "state": "catchup",
+          "sync_state": "potential"
+        }
+      ]
+    }
+  }
+}
+JSON
+  }
+
+  [ "$(_standby_replication_state 2)" = 'streaming' ]
+
+  # Reported as it is, not flattened into ok/not ok: a standby still catching up
+  # is a different problem from one the leader is not shipping to at all.
+  [ "$(_standby_replication_state 3)" = 'catchup' ]
+
+  # Absent from the leader's view entirely, which is what a standby that is up
+  # but never seeded looks like.
+  [ "$(_standby_replication_state 4)" = 'not replicating' ]
+}
+
+@test "verification reports replication state for each standby" {
+  spec 'version: "13.5"' 'sample_data: false' 'leader:' '  standbys: 2'
+
+  BIN_ENV_SOURCE_ONLY=1 source bin/env
+  _read_spec "$(_resolve_spec "$SPEC")"
+
+  _standby_replication_state() {
+    echo streaming
+  }
+
+  run _verify
+
+  [[ "$(rows)" == *'standby 2 replication streaming streaming ok'* ]]
+  [[ "$(rows)" == *'standby 3 replication streaming streaming ok'* ]]
+}
+
+@test "a standby that is up but not replicating fails verification" {
+  spec 'version: "13.5"' 'sample_data: false' 'leader:' '  standbys: 2'
+
+  BIN_ENV_SOURCE_ONLY=1 source bin/env
+  _read_spec "$(_resolve_spec "$SPEC")"
+
+  # Both containers are up, so the count alone says the environment is fine.
+  _running_standbys() {
+    echo 2
+  }
+  _standby_replication_state() {
+    if [ "$1" = 3 ]; then
+      echo 'not replicating'
+    else
+      echo streaming
+    fi
+  }
+
+  run _verify
+
+  [ "$status" -ne 0 ]
+  [[ "$(rows)" == *'standbys running 2 2 ok'* ]]
+  [[ "$(rows)" == *'standby 2 replication streaming streaming ok'* ]]
+  [[ "$(rows)" == *'standby 3 replication streaming not replicating MISMATCH'* ]]
+}
+
+@test "an enrolled cluster is verified node by node, not just by the leader's health" {
+  spec 'version: "13.5"' 'sample_data: false' 'leader:' '  standbys: 2' '  auto_failover: true'
+
+  BIN_ENV_SOURCE_ONLY=1 source bin/env
+  _read_spec "$(_resolve_spec "$SPEC")"
+
+  _cluster_member_names() {
+    echo 'conjur-master-1.mycompany.local'
+    echo 'conjur-master-2.mycompany.local'
+    echo 'conjur-master-3.mycompany.local'
+  }
+
+  run _verify
+
+  [[ "$(rows)" == *'cluster member 1 enrolled enrolled ok'* ]]
+  [[ "$(rows)" == *'cluster member 2 enrolled enrolled ok'* ]]
+  [[ "$(rows)" == *'cluster member 3 enrolled enrolled ok'* ]]
+}
+
+@test "a node missing from the cluster fails verification, naming the node" {
+  spec 'version: "13.5"' 'sample_data: false' 'leader:' '  standbys: 2' '  auto_failover: true'
+
+  BIN_ENV_SOURCE_ONLY=1 source bin/env
+  _read_spec "$(_resolve_spec "$SPEC")"
+
+  # The enrolment of the last standby did not take. etcd has a quorum without it,
+  # so the cluster is up and the leader is healthy -- and a failover would have
+  # one fewer node to elect from than the spec asked for.
+  _cluster_member_names() {
+    echo 'conjur-master-1.mycompany.local'
+    echo 'conjur-master-2.mycompany.local'
+  }
+
+  run _verify
+
+  [ "$status" -ne 0 ]
+  [[ "$(rows)" == *'cluster member 2 enrolled enrolled ok'* ]]
+  [[ "$(rows)" == *'cluster member 3 enrolled missing MISMATCH'* ]]
+}
+
+@test "a spec without auto-failover is not checked for cluster membership" {
+  spec 'version: "13.5"' 'sample_data: false' 'leader:' '  standbys: 2'
+
+  BIN_ENV_SOURCE_ONLY=1 source bin/env
+  _read_spec "$(_resolve_spec "$SPEC")"
+
+  run _verify
+
+  [[ "$output" != *'cluster member'* ]]
+}
+
+# The membership rows say a node is in the cluster etcd holds; they do not say
+# which cluster that is. The name gets its own row so the expected value is on the
+# table rather than implied by the auto-failover row reading `true`.
+@test "the cluster's name is verified as a row of its own" {
+  spec 'version: "13.5"' 'sample_data: false' 'leader:' '  standbys: 2' '  auto_failover: true'
+
+  BIN_ENV_SOURCE_ONLY=1 source bin/env
+  _read_spec "$(_resolve_spec "$SPEC")"
+
+  _leader_cluster_name() {
+    echo staging
+  }
+
+  run _verify
+
+  [ "$status" -ne 0 ]
+  [[ "$(rows)" == *'cluster name production staging MISMATCH'* ]]
+}
+
+@test "a spec without auto-failover has no cluster name row" {
+  spec 'version: "13.5"' 'sample_data: false'
+
+  BIN_ENV_SOURCE_ONLY=1 source bin/env
+  _read_spec "$(_resolve_spec "$SPEC")"
+
+  run _verify
+
+  [[ "$output" != *'cluster name'* ]]
+}
+
+@test "a cluster enrolled under an unexpected name is reported by that name" {
+  BIN_ENV_SOURCE_ONLY=1 source bin/env
+
+  # bin/dap enrols into `production`, and /info reports no cluster at all on a
+  # standalone leader. Anything else is neither, and naming it is more use than
+  # the word `unknown` -- the name is the thing the operator has to reconcile.
+  [ "$(_auto_failover_state production)" = 'true' ]
+  [ "$(_auto_failover_state none)" = 'false' ]
+  [ "$(_auto_failover_state staging)" = 'cluster staging' ]
+  [ "$(_auto_failover_state unreachable)" = 'unreachable' ]
+}
+
+@test "a standby the spec did not ask for gets no replication row" {
+  spec 'version: "13.5"' 'sample_data: false'
+
+  BIN_ENV_SOURCE_ONLY=1 source bin/env
+  _read_spec "$(_resolve_spec "$SPEC")"
+
+  run _verify
+
+  [[ "$output" != *'replication'* ]]
 }
 
 #
