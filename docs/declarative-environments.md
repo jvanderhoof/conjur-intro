@@ -234,10 +234,9 @@ themselves. Those were checked by hand against a live daemon and registry, bar t
 two cheap enough to assert for real: that a free port reads as free, and that a
 lookup still reaches its fallback on a host missing the tool it would rather use.
 
-Integration testing stays a manual run against a real appliance, as today. The one
-part of verification the fast tests can reach is its failure side: against a
-stopped environment every dimension must report a mismatch rather than crash or
-pass, which `bin/env` exposes by being sourceable.
+Provisioning a whole environment stays a manual run against a real appliance, as
+today. Verification does not: what the fast tests reach is every probe, and its
+behaviour against a stopped environment, which `bin/env` exposes by being sourceable.
 
 Stubbing a probe function tests what `_verify` does with an answer, not whether the
 probe asks the right question, and the replication probe proved that the hard way: a
@@ -246,18 +245,27 @@ two-standby cluster as `not replicating` on the first live run. The fix came wit
 test one seam lower — `curl` stubbed, the real probe called, against a body the
 appliance actually returned. Where a probe's filter encodes a claim about the
 appliance's JSON, that claim belongs in a test with a captured payload behind it;
-the payload is the part a stub cannot invent. The cluster-membership probe has the
-same shape and so has the same pair of tests, one of them for the answer that does
-not parse at all — under `set -o pipefail` a jq that cannot read its input takes the
-run down at the moment verification is trying to report.
+the payload is the part a stub cannot invent.
 
-Both were written after the code they cover, which makes them worth a moment's
+So every probe now has one, each at the seam it really has: `curl` for the `/health`
+and `/info` reads, `docker` for the image tag and the etcd member list, `bin/api` for
+the sample data. The cases they pin are the ones where two answers could be confused
+for each other, because those are the ones a wrong filter gets wrong silently — a
+leader whose services are fine but whose database is not, a standalone leader versus
+an appliance that did not answer with `/info` at all, a registry with a port in its
+name versus the image tag after it, a secret fetch that succeeded with nothing in it.
+The load balancer's `Authorization missing` is in there too, as the shape of a
+request that succeeds and tells you nothing.
+
+All of them were written after the code they cover, which makes them worth a moment's
 suspicion: a test written green proves only that it agrees with today's
-implementation. Each was checked by breaking the filter it pins and confirming it
-went red. That caught a genuinely empty one — asserting that an unparseable answer
-produces no output passes whether or not the pipeline survived it, because a failing
-command substitution does not fail the test around it. Asserting the exit status is
-what made it mean anything.
+implementation. Each was checked by breaking what it pins and confirming it went red.
+That caught a genuinely empty one — asserting that an unparseable answer produces no
+output passes whether or not the pipeline survived it, because a failing command
+substitution does not fail the test around it. Asserting the exit status is what made
+it mean anything. (And `set -o pipefail` is why that case exists at all: a jq that
+cannot read its input would otherwise take the run down at the moment verification is
+trying to report.)
 
 `--plan` therefore serves two needs at once: it is what makes the
 spec→sequence translation testable, and it is what the skill shows before provisioning.

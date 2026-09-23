@@ -934,9 +934,11 @@ bin/api --load-sample-policy-and-values' ]
 #
 ## Verification
 #
-# Only the failure side can be checked without a real appliance: with nothing
-# running, every dimension must come back as a mismatch rather than as a crash
-# or a pass. The happy path is a manual integration run.
+# Two kinds of test here. Against nothing running, every dimension must come back
+# as a mismatch rather than as a crash or a pass. Beyond that, each probe is called
+# for real against a payload the appliance returned, because the seam a stub of the
+# probe offers cannot check the question the probe asks -- see the probe tests
+# below. A full happy-path environment is still a manual integration run.
 
 @test "verification of an environment that is not running mismatches on every dimension" {
   spec 'version: "13.5"' 'sample_data: false'
@@ -1217,6 +1219,196 @@ conjur-master-3.mycompany.local' ]
   run _verify
 
   [[ "$output" != *'replication'* ]]
+}
+
+# The rest of the probes, each called for real against the seam it actually has:
+# curl for the two API reads, docker for the image tag, bin/api for the sample data.
+# Stubbing a probe checks what _verify does with an answer, never whether the probe
+# asked the right question -- which is how a filter keyed on the wrong field once
+# reported a healthy cluster as not replicating. Payloads below came off a live
+# appliance; where a case cannot be captured from a working environment, the comment
+# says what was changed and why that is all the code under test reads.
+
+@test "leader health is read from the flag /health sets, not from the request succeeding" {
+  BIN_ENV_SOURCE_ONLY=1 source bin/env
+
+  # Trimmed to what the filter can see. Note `services.ok`: the appliance rolls the
+  # service list up under its own `ok`, and reading that one would call a leader
+  # healthy while its database or its cluster was not. The top-level flag is the
+  # one that accounts for those, so it is the one this reads.
+  curl() {
+    cat <<'JSON'
+{
+  "ok": true,
+  "degraded": false,
+  "role": "master",
+  "services": { "possum": "ok", "ui": "ok", "ldap-sync": "disabled", "ok": true }
+}
+JSON
+  }
+
+  [ "$(_leader_health)" = 'ok' ]
+
+  # The same body with the flag flipped, which is all this filter reads. An
+  # appliance reporting itself unhealthy still answers the request, so the body is
+  # the only signal there is.
+  curl() {
+    cat <<'JSON'
+{
+  "ok": false,
+  "degraded": true,
+  "role": "master",
+  "services": { "possum": "ok", "ui": "ok", "ldap-sync": "disabled", "ok": true }
+}
+JSON
+  }
+
+  [ "$(_leader_health)" = 'not ok' ]
+}
+
+@test "an answer that is not the JSON expected is distinguished from no answer" {
+  BIN_ENV_SOURCE_ONLY=1 source bin/env
+
+  # What the load balancer in front of the leader really returns for a route it
+  # will not serve: a bare string, and a request that succeeded. Every probe goes
+  # through this, so getting it wrong would print `null` into the table instead.
+  curl() {
+    printf 'Authorization missing'
+  }
+
+  [ "$(_leader_health)" = 'unparseable' ]
+  [ "$(_leader_cluster_name)" = 'unparseable' ]
+
+  # Nothing listening is a different finding, and the operator acts on it
+  # differently: unreachable means bring the environment up, unparseable means look
+  # at what answered instead.
+  curl() {
+    return 7
+  }
+
+  [ "$(_leader_health)" = 'unreachable' ]
+}
+
+@test "the cluster name is read from the leader's own configuration" {
+  BIN_ENV_SOURCE_ONLY=1 source bin/env
+
+  # Captured from the enrolled cluster, trimmed to the configuration block.
+  # cluster_name is the field bin/dap itself reads to decide a cluster exists.
+  curl() {
+    cat <<'JSON'
+{
+  "release": "13.10.0",
+  "role": "master",
+  "configuration": {
+    "conjur": {
+      "account": "demo",
+      "cluster_leader": "conjur-master-1.mycompany.local",
+      "cluster_machine_name": "conjur-master-1.mycompany.local",
+      "cluster_name": "production",
+      "role": "master"
+    }
+  }
+}
+JSON
+  }
+
+  [ "$(_leader_cluster_name)" = 'production' ]
+
+  # A standalone leader answers with a configuration that has no cluster in it. That
+  # has to read as `none` and not as a broken probe, because it is the answer every
+  # single-node environment gives.
+  curl() {
+    cat <<'JSON'
+{
+  "release": "13.10.0",
+  "role": "master",
+  "configuration": { "conjur": { "account": "demo", "role": "master" } }
+}
+JSON
+  }
+
+  [ "$(_leader_cluster_name)" = 'none' ]
+
+  # JSON, but not /info at all. Reporting `none` here would be a wrong answer
+  # stated confidently -- `no cluster` and `no idea` are not the same finding.
+  curl() {
+    echo '{"error":"service unavailable"}'
+  }
+
+  [ "$(_leader_cluster_name)" = 'unparseable' ]
+}
+
+@test "the leader's image tag is read off the running container" {
+  BIN_ENV_SOURCE_ONLY=1 source bin/env
+
+  # Both calls answering as the live leader's did.
+  docker() {
+    case "$*" in
+      *'compose ps --quiet'* ) echo '396b878841751df0aa5a37920181343d7028d8f643466cfcf8479ec51a05fe9f' ;;
+      *inspect* ) echo 'registry.tld/conjur-appliance:5.0-stable' ;;
+      * ) return 1 ;;
+    esac
+  }
+
+  [ "$(_leader_image_tag)" = '5.0-stable' ]
+
+  # A registry with a port in it has two colons, so the tag is what follows the
+  # last one. Splitting on the first would report the tag as `5000/conjur-...`.
+  docker() {
+    case "$*" in
+      *'compose ps --quiet'* ) echo 'a6e6ff3b1c0a' ;;
+      *inspect* ) echo 'registry.tld:5000/conjur-appliance:13.5' ;;
+      * ) return 1 ;;
+    esac
+  }
+
+  [ "$(_leader_image_tag)" = '13.5' ]
+
+  # A container that exists but that docker will not describe. Distinct from `not
+  # running`, which is the answer when there is no container at all.
+  docker() {
+    case "$*" in
+      *'compose ps --quiet'* ) echo 'a6e6ff3b1c0a' ;;
+      * ) return 1 ;;
+    esac
+  }
+
+  [ "$(_leader_image_tag)" = 'unknown' ]
+}
+
+@test "sample data is verified by retrieving a secret, not by the fetch succeeding" {
+  BIN_ENV_SOURCE_ONLY=1 source bin/env
+
+  # What bin/api --fetch-secrets really prints against a leader carrying the sample
+  # policy: the values themselves.
+  bin/api() {
+    cat <<'JSON'
+{
+  "demo:variable:staging/my-app-1/postgres-database/password": "secret-p@ssword-staging-my-app-1",
+  "demo:variable:staging/my-app-1/postgres-database/port": "5432",
+  "demo:variable:staging/my-app-1/postgres-database/url": "staging.my-app-1.staging.mycompany-postgres.com/my-app",
+  "demo:variable:staging/my-app-1/postgres-database/username": "my-app-1"
+}
+JSON
+  }
+
+  [ "$(_sample_data_state)" = 'loaded' ]
+
+  # The same fetch succeeding with nothing to show, which is what a leader whose
+  # policy loaded but whose values never got set looks like. The exit status alone
+  # would call this loaded.
+  bin/api() {
+    echo '{}'
+  }
+
+  [ "$(_sample_data_state)" = 'not retrievable' ]
+
+  # And the fetch failing outright, where there is no output to grep at all.
+  bin/api() {
+    return 1
+  }
+
+  [ "$(_sample_data_state)" = 'not retrievable' ]
 }
 
 #
