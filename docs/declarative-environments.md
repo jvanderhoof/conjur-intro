@@ -179,9 +179,8 @@ at all — logical replication is not physical replication with a different host
 follower's own view wins on two counts: it still answers when the leader is
 unreachable, and it distinguishes receiving changes from applying them, where a
 follower streaming WAL it cannot apply reads as `streaming` from the leader's side.
-There is nothing to key the subscription on and nothing to key it on either — the
-name is an opaque `follower_<hex>_<hex>` and a follower has exactly its own
-subscriptions. **Secret read** goes end to end through the follower load balancer,
+There is nothing to key the subscription on and no need to — the name is an
+opaque `follower_<hex>_<hex>`, and a follower has exactly its own subscriptions. **Secret read** goes end to end through the follower load balancer,
 because it is the only row that authenticates, and because health and replication
 are both statements the follower makes about itself.
 

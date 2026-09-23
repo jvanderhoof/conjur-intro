@@ -33,10 +33,12 @@ CONJUR_FOLLOWER_PORT="${CONJUR_FOLLOWER_PORT:-450}"
 
 # What clients reach the follower tier through, and so how the retrieval check
 # reads. The follower load balancer's name on the compose network, not localhost,
-# because bin/api runs inside a container. https rather than the http that
-# bin/api's own --follower-url default uses: the load balancer terminates TLS with
-# the certificate `_setup_follower` installs, so going over https makes a broken
-# follower certificate a finding rather than something the check steps around.
+# because bin/api runs inside a container. Passed as --leader-url because that is
+# the URL bin/api fetches secrets from; it still authenticates through its own
+# --follower-url default, which is the same load balancer over http, so both halves
+# of the read go through the follower tier. It does not check the certificate --
+# bin/api's curls are all --insecure -- so a broken follower certificate is not
+# something this row can see.
 FOLLOWER_URL='https://conjur-follower.mycompany.local'
 
 # Holds the YAML parser and the JSON Schema validator so that neither is a host
@@ -835,8 +837,8 @@ function _follower_health {
 # from the leader's side and as `apply errors` from here.
 #
 # There is nothing to key the subscription on -- the name is an opaque
-# `follower_<hex>_<hex>` with no hostname in it -- and nothing to key it on either:
-# a follower has exactly its own subscriptions.
+# `follower_<hex>_<hex>` with no hostname in it -- and no need to: a follower has
+# exactly its own subscriptions.
 #
 # The type guard is not defensive. The leader answers this route with a *sentence*
 # under `subscriptions` ("Subscriptions are only available on Conjur Followers."),

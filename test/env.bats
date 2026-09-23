@@ -1327,9 +1327,22 @@ JSON
 
   # A follower left running from an earlier environment. The count row reports it, so
   # it is not hidden, but the spec asked for no follower and so there is nothing for
-  # the health, replication or retrieval rows to be desired against.
+  # the health, replication or retrieval rows to be desired against. Every other row
+  # is stubbed to pass, so that none of them reaches a real curl or docker.
   _running_followers() {
     echo 1
+  }
+  _running_standbys() {
+    echo 0
+  }
+  _leader_health() {
+    echo ok
+  }
+  _leader_cluster_name() {
+    echo none
+  }
+  _leader_image_tag() {
+    echo 13.5
   }
 
   run _verify
@@ -1358,9 +1371,24 @@ JSON
   _follower_replication_state() {
     echo replicating
   }
+  _running_standbys() {
+    echo 0
+  }
+  _leader_health() {
+    echo ok
+  }
+  _leader_cluster_name() {
+    echo none
+  }
+  _leader_image_tag() {
+    echo 13.5
+  }
 
   run _verify
 
+  # A clean exit as well as the missing row, since a retrieval row that was still
+  # probed and failed would otherwise go unnoticed.
+  [ "$status" -eq 0 ]
   [[ "$(rows)" == *'follower health ok ok ok'* ]]
   [[ "$(rows)" == *'follower replication replicating replicating ok'* ]]
   [[ "$(rows)" != *'follower secret read'* ]]
