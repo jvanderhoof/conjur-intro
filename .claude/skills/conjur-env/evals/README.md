@@ -29,7 +29,7 @@ agent that has the repo?", not "does it beat an agent that has nothing?".
 |---|---|---|
 | `complete` | States every field, in customer wording ("3-node cluster", "AFO", "MKE", "internal CA") | Each field's value in the written spec, and that every field is written out |
 | `underspecified` | Leaves most fields unstated | No spec is written, because the agent should ask first; a judge checks it asked about standbys, MKE and certificates |
-| `gaps` | Adds things no field expresses (authn-ldap, a DR standby, three followers) | No invented keys, the follower count capped, the core fields right; a judge checks all three gaps are named as set up by hand |
+| `gaps` | Adds things no field expresses (authn-ldap, a DR standby, five followers) | No invented keys, the follower count capped at 3, the core fields right; a judge checks all three gaps are named as set up by hand |
 
 ## Keeping the graders from being fragile
 

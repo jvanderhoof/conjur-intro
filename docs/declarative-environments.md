@@ -8,12 +8,14 @@ scope. For how to actually use the thing, see
 single-leader provisioning, verification and fast tests — is in place, and so are the
 guard rails: preflight, the refusal to reconcile, `--recreate`, and the podman
 refusal. So are standbys (up to 4) and auto-failover, with the quorum requirement as a
-cross-field schema rule, and one follower with its proxy trust and its own health,
-replication and retrieval checks. So are the three leader-hardening flags — master
-key encryption, custom certificates and generated DH parameters — each verified off
-the leader itself. So is the `conjur-env` skill, measured by an eval against a
-no-skill baseline rather than by tests. More than one follower is not. The
-schema refuses the topology `bin/env` cannot build rather than letting it provision
+cross-field schema rule. So are up to 3 followers behind a generated load balancer,
+with their proxy trust, health and replication checked per follower, a secret read
+through the load balancer, and a check that the load balancer routes to every one of
+them — pass 2's first increment, which has landed. So are the three
+leader-hardening flags — master key encryption, custom certificates and generated DH
+parameters — each verified off the leader itself. So is the `conjur-env` skill,
+measured by an eval against a no-skill baseline rather than by tests. The schema
+refuses the topology `bin/env` cannot build rather than letting it provision
 something smaller.
 **Date:** 2026-09-23
 **Scope:** Proof of concept. End-to-end first; robustness in later passes.
@@ -50,7 +52,7 @@ and is small enough to keep honest.
 | Path | Tracked? | Purpose |
 |---|---|---|
 | `environments/schema.json` | yes | The contract. `additionalProperties: false`, so an unsupported or typo'd key is a hard error rather than a silent no-op. Range and cross-field constraints live here, never in `bin/env`. |
-| `environments/examples/*.yml` | yes | Sanitized specs (single-node, HA-with-auto-failover, leader-and-follower, later multi-follower). Double as documentation and as test fixtures. |
+| `environments/examples/*.yml` | yes | Sanitized specs (single-node, HA-with-auto-failover, leader-and-follower, multiple-followers, hardened). Double as documentation and as test fixtures. |
 | `environments/*.yml` | **no — gitignored** | Real customer specs. |
 | `bin/env` | yes | The entrypoint. |
 | `artifacts/env-validator/` | yes | The pinned container that converts YAML to JSON and applies the schema. |
@@ -72,7 +74,7 @@ leader:
   master_key_encryption: true   # encrypt the leader's keys before anything is seeded
   custom_certificates: true     # bin/generate-certs' CA; requires standbys <= 2
   generate_dh: false            # the leader generates its own; see known debt
-followers: 1             # 0-1, the compose topology's ceiling
+followers: 1             # 0-3, the compose topology's ceiling
 sample_data: true        # default; runs bin/api --load-sample-policy-and-values
 
 # events: []             # reserved seam, not implemented
@@ -93,9 +95,10 @@ leader-hardening booleans, `followers`, `sample_data` and the reserved `events`.
 `const: false`, so a spec asking for a cluster was rejected by the schema rather
 than by a conditional in `bin/env`. Every ceiling is now the compose topology's
 instead: `standbys` is `0-4`, because `docker-compose.yml` defines
-`conjur-master-1` through `conjur-master-5`; `followers` is `0-1`, because it
-defines a single `conjur-follower-1` and the follower load balancer is configured
-with one backend server; and `auto_failover` is a plain boolean. Keeping the
+`conjur-master-1` through `conjur-master-5`; `followers` is `0-3`, because it
+defines `conjur-follower-1` through `conjur-follower-3` and the follower load
+balancer's config is generated with a backend per follower; and `auto_failover` is
+a plain boolean. Keeping the
 refusal in the schema is what makes "a spec that validates is a spec that can be
 provisioned" true, and what makes a hand-written spec fail exactly where a generated
 one does. The validator supplies the hint a bare range error cannot — what the
@@ -152,7 +155,7 @@ pointer and abort before anything is provisioned.
 | `--plan` | yes | Prints the ordered command sequence without executing, preceded by the preflight checks it would run. |
 | Preflight | yes | The requested appliance tag resolves — local cache first, then the registry under a 30s ceiling; required host ports are free; no environment already exists. Fails in seconds rather than six minutes into a run. |
 | Provision | yes | Sequences existing `bin/dap` / `bin/api` flags in dependency order. |
-| Verify | yes | Probes `/health` on the leader and on the follower, `/info` on the leader, standby and follower replication, cluster state, and a secret read through both the leader and the follower; prints a desired-vs-actual table; exits non-zero on mismatch. |
+| Verify | yes | Probes `/health` on the leader and on each follower, `/info` on the leader, standby and follower replication, cluster state, a secret read through both the leader and the follower load balancer, and which followers that load balancer routes to; prints a desired-vs-actual table; exits non-zero on mismatch. |
 | Re-run | yes | **No convergence.** If anything exists, refuse and direct the user to `--recreate`. |
 | `--recreate` | yes | Tears down and rebuilds, stating plainly that volumes (seeds, MKE key, audit data) are destroyed. |
 | Podman | yes | **Unsupported.** Refuses with a message pointing at `bin/podman-dap`. |
@@ -179,7 +182,8 @@ who joined, the member list knows who joined but not which cluster they are in �
 row whose DESIRED column reads `production` verifies the name in a way that one
 reading `true` only implies.
 
-A follower gets three rows, and the split is the point. **Health** is read from the
+Each follower gets two rows of its own, numbered as the standbys are, and the tier
+gets two more; the split is the point. **Health** is read from each
 follower's own port rather than through its load balancer or from the leader: the
 leader answers `/health` on the same route with the same shape and answers it `ok`,
 so a probe pointed at the wrong port would report a healthy follower whether or not
@@ -192,7 +196,13 @@ follower streaming WAL it cannot apply reads as `streaming` from the leader's si
 There is nothing to key the subscription on and no need to — the name is an
 opaque `follower_<hex>_<hex>`, and a follower has exactly its own subscriptions. **Secret read** goes end to end through the follower load balancer,
 because it is the only row that authenticates, and because health and replication
-are both statements the follower makes about itself.
+are both statements the follower makes about itself. **Backends used** is the
+load balancer's own account of which followers it chose, off the `lbtot` column of
+its stats page, across twice as many requests through it as there are followers.
+The secret read is one request and so one follower, and every follower healthy on
+its own port says nothing about whether the load balancer sends it anything — a
+backend it never marks up, a certificate it cannot verify say, leaves the tier
+serving from fewer followers than it has while every other row passes.
 
 Health and replication are separate rows because they fail separately, and the pair
 is what tells the states apart: `evoke seed follower` snapshots the leader's
@@ -355,29 +365,42 @@ reports for a dangling symlink rather than captured from a restarted MKE leader.
 `--plan` therefore serves two needs at once: it is what makes the
 spec→sequence translation testable, and it is what the skill shows before provisioning.
 
-### Pass 2 — first increment
+### Pass 2 — first increment (landed)
 
-`followers: 2..N`. Pass 1 ships `followers: 0..1`, which sequences existing `bin/dap`
-flags the way everything else in it does. Going beyond one is a different kind of
-work: new compose services, and a follower haproxy backend line per follower.
-`files/haproxy/follower/haproxy.cfg` is already generated at provisioning time and
-gitignored, as the master equivalent is (`_set_follower_proxy_config` in
-`bin/utils.sh`, shared with `bin/podman-dap`), so a second follower changes how
-many backends it emits rather than introducing generation.
+`followers: 0..3`. Pass 1 shipped `followers: 0..1`, which sequenced existing
+`bin/dap` flags the way everything else in it does; going beyond one was a different
+kind of work, kept apart so the PoC's riskiest question (does the whole chain hold
+together?) stayed apart from its fiddliest one. What it took:
 
-That is why the ceiling stops at one rather than at zero. One follower needs nothing
-the compose file does not already define, so it belongs with the rest of pass 1;
-the second is the first thing in scope that needs the compose file to change. Keeping
-them apart keeps the PoC's riskiest question (does the whole chain hold together?)
-apart from its fiddliest one (compose services, per-follower backends, the shared
-`follower-certs` volume).
+- **Compose services.** `conjur-follower-2` and `conjur-follower-3`, published on
+  452 and 453 — 450 plus the number, stepping over 451, which is
+  `CONJUR_K8S_FOLLOWER_PORT`'s default. `_follower_port` in `bin/utils.sh` is the
+  one place that arithmetic lives. `bin/dap --follower-count` starts only the
+  followers asked for, so the rest stay down rather than up and idle.
+- **The shared certificate volume.** `follower-certs` is follower 1's
+  `/opt/conjur/etc/ssl`, shared with the load balancer so it can serve the follower
+  certificate that `_setup_follower` copies there. A second follower mounting it
+  would configure its certificates over the first one's, so followers 2 and 3 do
+  not: each keeps its own, and only follower 1's copy feeds the load balancer. They
+  all come from the one seed, so they all present the same certificate chained to
+  the same CA, which is what the load balancer verifies them against.
+- **One seed, a copy per follower.** `evoke seed follower` is run once — the seed
+  carries the leader's data key and the follower certificate, nothing that ties it
+  to one follower, and each follower creates its own replication subscription when
+  it is configured. It is `tee`'d into a file per follower rather than shared as
+  one, because `evoke unpack seed` removes the file it unpacks: the first live run
+  configured follower 1 and then failed follower 2's unpack on a missing seed. One
+  seed also means the master key decrypt and re-encrypt on the leader happens once
+  however many followers there are.
+- **A backend per follower.** `files/haproxy/follower/haproxy.cfg` was already
+  generated at provisioning time, so this changed how many server lines it emits.
+  The server line lost the doubled `check port 443` and `ca-file` it carried, and
+  the line-per-node loop it shared in shape with three copies in `bin/dap` is now
+  one `_numbered_lines` in `bin/utils.sh` that all of them call.
 
-The verification rows are ready for it in shape but not in form: `follower health`,
-`follower replication` and `follower secret read` are single rows, and with more than
-one follower they become one row per follower — the way `standby N replication`
-already reads. `_probe` is already parameterised by port — `_leader_probe` and
-`_follower_probe` are both one-line delegations to it — so that is a change to
-`_verify` and to how a follower's port is derived, not to any of the filters.
+The verification rows became one pair per follower, the way `standby N replication`
+already read, which was a change to `_verify` and to the port a follower probe asks,
+not to any filter.
 
 ---
 
@@ -417,7 +440,7 @@ and what they describe that no field expresses. That way a new field or a widene
 range needs no edit to the skill's prose to be enforced.
 
 **A topology larger than the schema accepts is capped and named.** When a customer
-has three followers and the schema accepts one, the spec says one, and the gap
+has five followers and the schema accepts three, the spec says three, and the gap
 list says two more were asked for. Capping is the only choice that still validates.
 Naming the shortfall at the gate keeps it from being a silent approximation.
 
@@ -460,7 +483,12 @@ back into a spec.
 2. **A third copy of ordering knowledge.** `bin/env` duplicates sequencing that
    `ci/providers/docker_compose.rb` already encodes, which itself duplicates
    `bin/dap`. The PoC knowingly adds a third copy. Recording it here so it is known
-   debt rather than a later discovery. Consolidation is its own piece of work.
+   debt rather than a later discovery. Consolidation is its own piece of work. The
+   Ruby copy has already drifted: it provisions a single follower its own way, and
+   reaches into `bin/utils.sh` for `_set_follower_proxy_config` through `bash -c`,
+   which makes an underscore-prefixed helper a cross-language interface. It still
+   works, because the helper defaults to one follower, but it is the thing to
+   replace with `bin/dap --provision-follower` rather than to keep in step.
 3. **Nothing here is in CI.** `Jenkinsfile` runs only `bin/upgrade-test FROM TO`. It
    invokes neither `ci/bin/end-to-end-tests` nor `bin/env-test`, so there is no
    automated integration coverage of provisioning at all, and the fast suite — which
@@ -554,7 +582,10 @@ back into a spec.
 | Podman | Unsupported, explicitly | Avoids a third fork of drifted provisioning logic. |
 | Podman detection | String-match `DOCKER_HOST`, the server platform and `docker --version` | No single authoritative field, and the check cannot depend on the daemon being up. |
 | Testing | `--plan` plus bats; integration manual | Tests what will regress, without pretending to cover what CI can't reach. |
-| Multi-follower | Pass 2 | Separates the riskiest question from the fiddliest. |
+| Multi-follower | Pass 2, landed with a ceiling of 3 | Separates the riskiest question from the fiddliest. |
+| Follower certificates | Follower 1 shares its certificate directory with the load balancer; the others keep their own | Two followers on one volume configure over each other's certificates. |
+| Follower seeds | One seed, `tee`'d into a copy per follower | Nothing in it is per-follower, and the leader's MKE decrypt/re-encrypt then happens once; the copies because unpacking a seed removes it. |
+| Load balancer routing | Verified off HAProxy's own `lbtot`, not inferred from follower health | A follower can be healthy on its own port and never routed to. |
 | KB access | Vendored reference | No path dependency on a single machine's clone. |
 | Skill gate | One gate: spec, gaps, plan, destruction warning | Folds the destructive confirm into the same decision point. |
 | Unstated dimensions | Ask about every one | A repro is worth the extra turns; there are only a handful of fields. |

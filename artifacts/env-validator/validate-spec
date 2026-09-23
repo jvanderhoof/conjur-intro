@@ -134,14 +134,15 @@ def hint_for(pointer, message):
         )
 
     # The same shape one tier down, and the same thing a bare range error cannot
-    # say: a second follower needs a new compose service as well as its own
-    # backend in the generated proxy config, which is why the ceiling is where
-    # it is.
+    # say: it is the compose file that runs out of followers. The proxy config is
+    # generated with a backend per follower, so a fourth takes a compose service,
+    # its host in the follower certificate and FOLLOWER_CEILING in bin/utils.sh --
+    # not a change to how bin/env provisions.
     if pointer == "/followers" and "greater than the maximum" in message:
         return (
-            "docker-compose.yml defines a single conjur-follower-1, and the "
-            "follower load balancer's generated config has one backend server, so "
-            "more followers would need new compose services and a backend for each"
+            "docker-compose.yml defines conjur-follower-1 through "
+            "conjur-follower-3, so at most 3 followers; more would need new "
+            "compose services"
         )
 
     return None

@@ -127,7 +127,7 @@ fails loudly instead.
 | `leader.master_key_encryption` | boolean | `false` | Encrypts the leader's server keys with a master key — [see below](#leader-hardening) |
 | `leader.custom_certificates` | boolean | `false` | Replaces the leader's self-signed certificates with ones from `bin/generate-certs`; `true` allows at most 2 standbys — [see below](#leader-hardening) |
 | `leader.generate_dh` | boolean | `false` | Has the leader generate its own DH parameters; does not work on 5.0-stable — [see below](#leader-hardening) |
-| `followers` | integer | `0` | `0`–`1` — [see below](#followers) |
+| `followers` | integer | `0` | `0`–`3` — [see below](#followers) |
 | `sample_data` | boolean | `true` | Loads the sample policy and variable values via `bin/api --load-sample-policy-and-values`. |
 | `events` | array | — | `[]` only. Reserved seam for transitions (upgrades, promotions, failovers); **not implemented**. |
 
@@ -216,8 +216,8 @@ configures its proxy trust in the same run, so there is no manual follow-up step
 Commands:
   1. bin/dap --version 5.0-stable --provision-master
   2. bin/dap --wait-for-master
-  3. bin/dap --version 5.0-stable --provision-follower
-  4. bin/dap --trust-follower-proxy
+  3. bin/dap --version 5.0-stable --follower-count 1 --provision-follower
+  4. bin/dap --follower-count 1 --trust-follower-proxy
   5. bin/api --load-sample-policy-and-values
 ```
 
@@ -242,31 +242,59 @@ enrolment: `evoke configure follower` installs the failover rebaser, which is wh
 repoints the follower at a newly promoted leader, so the cluster wants to exist by
 the time the follower is configured against it.
 
-**The ceiling is one follower**, and it is the compose topology's again —
-`docker-compose.yml` defines a single `conjur-follower-1`, and the follower load
-balancer's generated config has one backend server, so a second needs a new compose
-service as well as its own backend in that config:
+**More than one follower is a load-balanced tier.**
+[`environments/examples/multiple-followers.yml`](../environments/examples/multiple-followers.yml)
+asks for two. Each is provisioned, configured and told to trust the load balancer,
+and the load balancer's config is generated with a backend per follower, balanced
+round-robin:
 
 ```
-bin/env: spec error at /followers: 2 is greater than the maximum of 1
-bin/env:   hint: docker-compose.yml defines a single conjur-follower-1, and the follower load balancer's generated config has one backend server, so more followers would need new compose services and a backend for each
+Commands:
+  1. bin/dap --version 5.0-stable --provision-master
+  2. bin/dap --wait-for-master
+  3. bin/dap --version 5.0-stable --follower-count 2 --provision-follower
+  4. bin/dap --follower-count 2 --trust-follower-proxy
+  5. bin/api --load-sample-policy-and-values
+```
+
+Every follower is configured from the one follower seed, each from its own copy
+of it, since `evoke unpack seed` removes the file it unpacks. Only follower 1
+shares its certificate directory with the load balancer (the `follower-certs`
+volume) — that is where the load balancer's own certificate comes from — and the
+others keep theirs to themselves, so no follower configures over another's
+certificates.
+
+**The ceiling is three followers**, and it is the compose topology's again —
+`docker-compose.yml` defines `conjur-follower-1` through `conjur-follower-3`, so a
+fourth needs a new compose service:
+
+```
+bin/env: spec error at /followers: 4 is greater than the maximum of 3
+bin/env:   hint: docker-compose.yml defines conjur-follower-1 through conjur-follower-3, so at most 3 followers; more would need new compose services
 bin/env: the spec was not accepted, so nothing was provisioned.
 ```
 
-**The follower tier takes four more host ports**, so they join preflight: 80, 449
-and 7001 for the load balancer, and 450 for the follower appliance itself. A spec
-with a follower checks `443, 444, 7000, 80, 449, 450, 7001`. `CONJUR_FOLLOWER_PORT`
-moves 450; the other three are fixed in `docker-compose.yml`. Port **80** is the one
-most likely to already be in use on a developer's machine, which is why it is
-checked rather than discovered when compose fails.
+Asking for fewer leaves the rest of those services down, not started and idle.
 
-**A follower is verified independently of the leader**, on three rows rather than
-one — see [Reading the verification table](#reading-the-verification-table). The
-pair that matters is health and replication: a follower whose replication stopped
-right after it was seeded is up, reports itself healthy, and keeps serving data that
-is quietly out of date.
+**The follower tier's host ports join preflight**: 80, 449 and 7001 for the load
+balancer, and one per follower — 450 for the first, then 452 and 453, stepping over
+451, which the kubernetes follower uses. A spec with one follower checks
+`443, 444, 7000, 80, 449, 450, 7001`, and with three
+`443, 444, 7000, 80, 449, 450, 452, 453, 7001`. `CONJUR_FOLLOWER_PORT` moves 450;
+the others are fixed in `docker-compose.yml`. Port **80** is the one most likely to
+already be in use on a developer's machine, which is why it is checked rather than
+discovered when compose fails.
 
-Expect 5–10 minutes for the follower on top of the leader's own time.
+**Each follower is verified independently of the leader and of the others**, on
+two rows of its own, and the tier on two more — see
+[Reading the verification table](#reading-the-verification-table). The pair that
+matters per follower is health and replication: a follower whose replication
+stopped right after it was seeded is up, reports itself healthy, and keeps serving
+data that is quietly out of date. The pair that matters for the tier is a secret
+read through the load balancer and which followers the load balancer actually
+routes to.
+
+Expect 5–10 minutes per follower on top of the leader's own time.
 
 ## Leader hardening
 
@@ -301,8 +329,8 @@ Commands:
   5. bin/dap --wait-for-master
   6. bin/dap --version 5.0-stable --standby-count 2 --provision-standbys
   7. bin/dap --standby-count 2 --enable-auto-failover
-  8. bin/dap --version 5.0-stable --provision-follower
-  9. bin/dap --trust-follower-proxy
+  8. bin/dap --version 5.0-stable --follower-count 1 --provision-follower
+  9. bin/dap --follower-count 1 --trust-follower-proxy
   10. bin/api --load-sample-policy-and-values
 ```
 
@@ -536,7 +564,8 @@ Verification
   sample data            loaded           loaded           ok
 ```
 
-A follower adds three rows of its own, none of which the leader can answer for:
+Followers add two rows each and two for the tier, none of which the leader can
+answer for. From `multiple-followers.yml`:
 
 ```
 Verification
@@ -545,11 +574,17 @@ Verification
   leader health          ok               ok               ok
   leader /info           reported         reported         ok
   leader image tag       5.0-stable       5.0-stable       ok
+  master key encryption  not encrypted    not encrypted    ok
+  leader certificate     appliance CA     appliance CA     ok
+  dh parameters          pre-generated    pre-generated    ok
   standbys running       0                0                ok
-  followers running      1                1                ok
-  follower health        ok               ok               ok
-  follower replication   replicating      replicating      ok
+  followers running      2                2                ok
+  follower 1 health      ok               ok               ok
+  follower 1 replication replicating      replicating      ok
+  follower 2 health      ok               ok               ok
+  follower 2 replication replicating      replicating      ok
   follower secret read   retrievable      retrievable      ok
+  follower backends used 2                2                ok
   auto-failover          false            false            ok
   sample data            loaded           loaded           ok
 ```
@@ -601,11 +636,11 @@ What the dimensions mean:
   it returns, so a standby still catching up at verification time is a real finding,
   and the distinction between "behind" and "not connected" is the first thing you
   want to know.
-- **follower health** — `/health` on the follower's *own* port, not through the
+- **follower N health** — `/health` on that follower's *own* port, not through the
   follower load balancer and not through the leader. The leader answers `/health`
   too, and answers it `ok`, so this row only means something because it asks the
-  follower directly. Only shown when `followers` is 1.
-- **follower replication** — the follower's own view of its pglogical
+  follower directly. One per follower the spec asks for.
+- **follower N replication** — that follower's own view of its pglogical
   subscriptions, under `/health`. Followers replicate *logically*, so they have no
   row in the leader's `pg_stat_replication` — this is not the standby check with a
   different host. Read from the follower rather than the leader for two reasons: it
@@ -624,13 +659,20 @@ What the dimensions mean:
   `last_msg_receipt_time`, because every healthy follower is some microseconds behind
   the leader and a threshold on that would fail runs at random. The
   `follower secret read` row is the thing that catches a stalled follower in practice:
-  it reads a secret that could only have arrived by replicating. Only shown when
-  `followers` is 1.
+  it reads a secret that could only have arrived by replicating. One per follower
+  the spec asks for.
 - **follower secret read** — the sample secret fetched back *through the follower
-  load balancer*, which is the only row that authenticates and the only one that
-  goes through the load balancer rather than straight at the appliance. A follower
-  whose health is ok and whose replication is current is still useless if nothing can
-  authenticate against it. Shown when `followers` is 1 and `sample_data` is true.
+  load balancer*, which is the only row that authenticates. A follower whose health
+  is ok and whose replication is current is still useless if nothing can
+  authenticate against it. Shown when `followers` is at least 1 and `sample_data`
+  is true. It is one read, and so it speaks for whichever follower answered it.
+- **follower backends used** — how many followers the load balancer chose while
+  `bin/env` sent twice that many requests through it, read off the `lbtot` column
+  of its stats page (`http://localhost:7001/;csv`) before and after. Every
+  follower passing its own rows says nothing about this: a follower the load
+  balancer never marks up — one whose certificate it cannot verify, say — leaves the
+  tier serving from fewer followers than it has. `unreachable` means the stats page
+  did not answer. Shown when `followers` is at least 1.
 - **auto-failover** — whether the leader is clustered at all, read from the cluster
   name under `/info`, the same way the rest of `bin/dap` detects a cluster. A
   cluster under an unexpected name is reported as `cluster <name>` rather than
@@ -668,14 +710,11 @@ Every field's ceiling is the topology `bin/env` can actually build, and it rises
 provisioned" stay the same claim. Asking for more than a ceiling is a schema error
 naming what raising it would take, rather than a topology quietly built smaller
 than you asked for: at most 4 standbys
-([see above](#standbys-and-auto-failover)) and at most 1 follower
+([see above](#standbys-and-auto-failover)) and at most 3 followers
 ([see above](#followers)). Beyond those, use `bin/dap` by hand.
 
 Also not supported, by design or by not-yet:
 
-- **More than one follower.** One `conjur-follower-1` in `docker-compose.yml`, and
-  one backend server in the follower load balancer's generated config. A second
-  needs both a new compose service and a backend of its own in that config.
 - **Transitions.** `events:` is a reserved key, not a feature. Upgrades,
   promotions and triggered failovers are run by hand with `bin/dap`.
 - **Convergence.** There is no reconcile, by design: `bin/env` builds from clean
@@ -747,8 +786,8 @@ curl -sk https://localhost:450/health \
   | jq '.database.logical_replication_status'
 ```
 
-Port 450 is the follower appliance itself (`CONJUR_FOLLOWER_PORT`), which is what
-`bin/env` probes. Asking the *leader* on 443 is a different question and gives a
+Port 450 is follower 1 itself (`CONJUR_FOLLOWER_PORT`), which is what `bin/env`
+probes for `follower 1`; followers 2 and 3 are on 452 and 453. Asking the *leader* on 443 is a different question and gives a
 misleading answer: it replies with `"subscriptions": "Subscriptions are only
 available on Conjur Followers."`, a sentence rather than a list, which is why the row
 reads `not a follower` if the probe is ever pointed at the wrong port. Followers
@@ -762,11 +801,24 @@ through the load balancer, so compare it against the appliance directly:
 
 ```sh
 curl -sk https://localhost:449/health   # through the load balancer
-curl -sk https://localhost:450/health   # the follower itself
+curl -sk https://localhost:450/health   # follower 1 itself; 452 and 453 for 2 and 3
 ```
 
 Proxy trust is *not* the cause: without it the read still works, and the audit
 records simply attribute it to the load balancer's address.
+
+**`follower backends used` is short of the follower count while every follower's
+own rows pass.** The followers are fine and the load balancer is not sending to
+all of them. Its stats page says which it has marked down and why:
+
+```sh
+curl -s 'http://localhost:7001/;csv' | cut -d, -f1,2,18,37 | grep www-backend
+```
+
+That is each backend's status and its last health check, which is `L7OK` for a
+follower it is routing to. For one that is `DOWN`, the check status says whether it
+could not reach the follower, could not verify its certificate against the CA in
+`follower-certs`, or got a response other than a healthy one.
 
 **Audit records or IP-restricted hosts see the load balancer's address, not the
 client's.** Proxy trust did not take. No verification row covers it — nothing the
@@ -776,7 +828,8 @@ follower answers reports its trusted proxies — so check it by hand:
 docker compose exec conjur-follower-1.mycompany.local evoke proxy list
 ```
 
-It should name `12.16.23.16`, the follower load balancer. Anything else, or `No
+It should name `12.16.23.16`, the follower load balancer, on every follower — ask
+`conjur-follower-2` and `-3` the same way. Anything else, or `No
 proxies`, and `docker compose exec conjur-follower-1.mycompany.local evoke proxy
 add 12.16.23.16` sets it. An environment provisioned before this was fixed has
 `12.16.23.15` — `conjur-master-5`, which never forwards to the follower — so the

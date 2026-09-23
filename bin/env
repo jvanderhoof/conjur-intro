@@ -24,12 +24,19 @@ dotenv > /dev/null 2>&1 || true
 
 CONJUR_MASTER_PORT="${CONJUR_MASTER_PORT:-443}"
 
-# The follower appliance's own published port, read the same way docker-compose.yml
-# reads it. Verification probes the appliance here rather than through the load
-# balancer so that follower health and replication are separate findings from the
-# follower tier's proxy -- an haproxy that is down then shows up as the secret not
-# reading back, and not as three mismatched rows that all point at each other.
+# Follower 1's own published port, read the same way docker-compose.yml reads it;
+# bin/utils.sh's _follower_port derives every follower's from it. Verification
+# probes each follower on its own port rather than through the load balancer so
+# that follower health and replication are separate findings from the follower
+# tier's proxy -- an haproxy that is down then shows up as the secret not reading
+# back, and not as mismatched rows that all point at each other.
 CONJUR_FOLLOWER_PORT="${CONJUR_FOLLOWER_PORT:-450}"
+
+# The follower load balancer as the host reaches it, and its stats page, which is
+# where the load balancer says which followers it has been sending requests to.
+# Both fixed in docker-compose.yml.
+FOLLOWER_LB_HEALTH_URL='https://localhost:449/health'
+FOLLOWER_LB_STATS_URL='http://localhost:7001/;csv'
 
 # What clients reach the follower tier through, and so how the retrieval check
 # reads. The follower load balancer's name on the compose network, not localhost,
@@ -43,7 +50,7 @@ FOLLOWER_URL='https://conjur-follower.mycompany.local'
 
 # Holds the YAML parser and the JSON Schema validator so that neither is a host
 # dependency. Bump the tag when artifacts/env-validator changes.
-VALIDATOR_IMAGE='conjur-intro/env-validator:4'
+VALIDATOR_IMAGE='conjur-intro/env-validator:5'
 SCHEMA='environments/schema.json'
 
 # The appliance image docker-compose.yml starts. Preflight resolves the
@@ -87,7 +94,8 @@ The spec is a YAML file validated against $SCHEMA; an unknown or
 misspelled key, or a topology bin/env cannot build, is a hard error naming the
 offending field. Start from environments/examples/single-node.yml,
 environments/examples/highly-available.yml for a leader with standbys,
-environments/examples/leader-and-follower.yml for a leader and a follower, or
+environments/examples/leader-and-follower.yml for a leader and a follower,
+environments/examples/multiple-followers.yml for a load-balanced follower tier, or
 environments/examples/hardened.yml for custom certificates and master key
 encryption across all three tiers.
 
@@ -102,11 +110,11 @@ to the public conjurdemos GitHub org, so customer hostnames and admin passwords
 must never end up in a tracked file.
 
 Up to 4 standbys can be provisioned, optionally enrolled in an auto-failover
-cluster -- which needs at least 2 of them to hold a quorum. One follower can be
-provisioned alongside them; asking for a follower also configures its proxy trust,
-so there is no manual follow-up step. A second follower would need a new compose
-service and its own backend in the follower proxy config, so the schema rejects
-it rather than letting bin/env quietly build something smaller.
+cluster -- which needs at least 2 of them to hold a quorum. Up to 3 followers can
+be provisioned alongside them, behind a load balancer generated with a backend per
+follower; asking for followers also configures their proxy trust, so there is no
+manual follow-up step. A fourth would need a new compose service, so the schema
+rejects it rather than letting bin/env quietly build something smaller.
 
 The leader can be hardened with master key encryption, custom certificates and
 generated DH parameters, each an independent boolean that defaults to off. All
@@ -313,6 +321,16 @@ function _standby_numbers {
   done
 }
 
+# The followers the spec asked for, by number. Followers have a tier of their own,
+# so they start at 1.
+function _follower_numbers {
+  local number
+
+  for (( number = 1; number <= SPEC_FOLLOWERS; number++ )); do
+    echo "$number"
+  done
+}
+
 ### Host ports
 
 # The host ports the planned topology binds. docker compose fails on a port it
@@ -337,13 +355,18 @@ function _required_ports {
   echo 7000                   # the leader load balancer's stats page
 
   if (( SPEC_FOLLOWERS > 0 )); then
-    # Three for the follower load balancer and one for the appliance. Plain 80 is in
+    # Three for the follower load balancer and one for each follower. Plain 80 is in
     # there, which is the one most likely to be in use already on a developer's
     # machine, and the reason this is worth checking rather than discovering when
     # compose fails.
     echo 80                       # the follower load balancer, unencrypted
     echo 449                      # the follower load balancer
-    echo "$CONJUR_FOLLOWER_PORT"  # the follower appliance, published directly
+
+    # Each follower published directly, on bin/utils.sh's _follower_port.
+    for number in $(_follower_numbers); do
+      _follower_port "$number"
+    done
+
     echo 7001                     # the follower load balancer's stats page
   fi
 }
@@ -478,9 +501,10 @@ function _refuse_ports {
   echo 'bin/env: a host port this environment needs is already in use:' >&2
   printf '%s' "$conflicts" >&2
   echo 'bin/env:   CONJUR_MASTER_PORT moves the leader load balancer off 443, and' >&2
-  echo 'bin/env:   CONJUR_FOLLOWER_PORT moves the follower appliance off 450. The other' >&2
-  echo 'bin/env:   ports -- 444 for the leader, then 445 up, one per standby, 7000, and' >&2
-  echo 'bin/env:   80, 449 and 7001 for the follower load balancer -- are fixed in' >&2
+  echo 'bin/env:   CONJUR_FOLLOWER_PORT moves the first follower off 450. The other' >&2
+  echo 'bin/env:   ports -- 444 for the leader, then 445 up, one per standby, 7000,' >&2
+  echo 'bin/env:   452 and 453 for the second and third followers, and 80, 449 and' >&2
+  echo 'bin/env:   7001 for the follower load balancer -- are fixed in' >&2
   echo 'bin/env:   docker-compose.yml, so those have to be freed.' >&2
   exit 1
 }
@@ -683,10 +707,13 @@ function _provision_commands {
   # would pass on a follower that is not replicating at all. Seeded first, the
   # sample secret can only reach the follower by replicating.
   #
-  # --version for the same reason as the standbys: this brings conjur-follower-1 up,
-  # and compose resolves its image from VERSION.
+  # --version for the same reason as the standbys: this brings the followers up,
+  # and compose resolves their image from VERSION. --follower-count on both
+  # commands, as --standby-count is on the standby ones: the first decides which
+  # followers are started and how many backends the load balancer gets, the second
+  # which followers are told to trust it.
   if (( SPEC_FOLLOWERS > 0 )); then
-    echo "bin/dap --version $SPEC_VERSION --provision-follower"
+    echo "bin/dap --version $SPEC_VERSION --follower-count $SPEC_FOLLOWERS --provision-follower"
 
     # Tells the follower to trust the X-Forwarded-For its load balancer sets, so
     # that audit records and IP-restricted host identities see the real client
@@ -696,8 +723,8 @@ function _provision_commands {
     # command in bin/dap, and so a separate command here, but not an optional one:
     # requesting a follower should not leave a manual step behind.
     #
-    # No --version -- it only execs into the running follower.
-    echo 'bin/dap --trust-follower-proxy'
+    # No --version -- it only execs into the running followers.
+    echo "bin/dap --follower-count $SPEC_FOLLOWERS --trust-follower-proxy"
   fi
 
   if [[ "$SPEC_SAMPLE_DATA" == true ]]; then
@@ -743,12 +770,20 @@ function _check_descriptions {
   # Asked of the follower itself rather than of the leader, so that a follower that
   # is up while the leader is not still reports its own state -- and so that a
   # leader that is fine cannot answer for a follower that is not.
-  if (( SPEC_FOLLOWERS > 0 )); then
-    echo 'follower /health reports ok'
-    echo 'follower is replicating from the leader'
+  for number in $(_follower_numbers); do
+    echo "follower $number /health reports ok"
+    echo "follower $number is replicating from the leader"
+  done
 
+  if (( SPEC_FOLLOWERS > 0 )); then
     if [[ "$SPEC_SAMPLE_DATA" == true ]]; then
-      echo "sample secret $SAMPLE_SECRET is retrievable through the follower"
+      echo "sample secret $SAMPLE_SECRET is retrievable through the follower load balancer"
+    fi
+
+    if (( SPEC_FOLLOWERS == 1 )); then
+      echo 'follower load balancer routes to 1 follower'
+    else
+      echo "follower load balancer routes to $SPEC_FOLLOWERS followers"
     fi
   fi
 
@@ -888,12 +923,13 @@ function _leader_probe {
   _probe "$CONJUR_MASTER_PORT" "$1" "$2"
 }
 
-# The port is what makes this the follower's answer and not the leader's, and it is
-# the whole difference between the two: a follower answers /health on the same route
-# with the same shape, so a probe pointed at the wrong port reports on the wrong
-# appliance without any sign that it has.
+# Follower $1's answer. The port is what makes this that follower's answer and not
+# the leader's or another follower's, and it is the whole difference between them: a
+# follower answers /health on the same route with the same shape, so a probe
+# pointed at the wrong port reports on the wrong appliance without any sign that it
+# has.
 function _follower_probe {
-  _probe "$CONJUR_FOLLOWER_PORT" "$1" "$2"
+  _probe "$(_follower_port "$1")" "$2" "$3"
 }
 
 # The top-level flag, shared by both appliances because it is the same claim about
@@ -907,7 +943,7 @@ function _leader_health {
 }
 
 function _follower_health {
-  _follower_probe 'health' "$HEALTH_FILTER"
+  _follower_probe "$1" 'health' "$HEALTH_FILTER"
 }
 
 # Followers replicate logically, over pglogical subscriptions, so they have no row
@@ -926,7 +962,7 @@ function _follower_health {
 # so without it a probe pointed at the leader would take that string's truthiness
 # for a healthy follower.
 function _follower_replication_state {
-  _follower_probe 'health' '
+  _follower_probe "$1" 'health' '
     if .database.logical_replication_status == null then null else
       .database.logical_replication_status as $status
       | ($status.subscriptions // []) as $subscriptions
@@ -1170,11 +1206,16 @@ function _running_standbys {
 }
 
 function _running_followers {
-  if [[ -n "$(docker compose ps --quiet --status running conjur-follower-1.mycompany.local 2> /dev/null)" ]]; then
-    echo 1
-  else
-    echo 0
-  fi
+  local count=0
+  local number
+
+  for ((number = 1; number <= FOLLOWER_CEILING; number++)); do
+    if [[ -n "$(docker compose ps --quiet --status running "conjur-follower-$number.mycompany.local" 2> /dev/null)" ]]; then
+      count=$((count + 1))
+    fi
+  done
+
+  echo "$count"
 }
 
 # Whether the sample secret reads back through the bin/api invocation given. The
@@ -1214,6 +1255,62 @@ function _follower_secret_state {
   else
     echo 'not retrievable'
   fi
+}
+
+# Each follower's lbtot -- the number of times the load balancer has chosen it --
+# off the stats page, one `name count` line per follower. Columns are found by name
+# in the header rather than by position, which HAProxy does not promise to keep.
+function _follower_backend_selections {
+  local csv
+
+  if ! csv="$(curl --silent --max-time 10 "$FOLLOWER_LB_STATS_URL")"; then
+    return 1
+  fi
+
+  awk -F, '
+    NR == 1 {
+      sub(/^# /, "")
+      for (i = 1; i <= NF; i++) column[$i] = i
+      next
+    }
+    $column["pxname"] == "www-backend" && $column["svname"] !~ /^(FRONTEND|BACKEND)$/ {
+      print $column["svname"], $column["lbtot"]
+    }' <<< "$csv"
+}
+
+# How many followers the load balancer actually sends requests to. Every follower
+# healthy on its own port says nothing about this: a backend the load balancer
+# never marks up -- one whose certificate it cannot verify, say -- leaves the tier
+# serving from fewer followers than it has, while every other follower row passes.
+#
+# So it asks the load balancer. Twice as many requests as there are followers go
+# through it, and a follower counts if the load balancer chose it for any of them.
+# Round-robin would reach each with half as many; the slack is for a health check
+# or another client landing in between. The counts are cumulative, so it is the
+# difference across the requests that is read, not the totals.
+function _follower_backends_used {
+  local before
+  local after
+  local request
+
+  if ! before="$(_follower_backend_selections)"; then
+    echo 'unreachable'
+    return
+  fi
+
+  for (( request = 0; request < 2 * SPEC_FOLLOWERS; request++ )); do
+    curl --insecure --silent --max-time 10 "$FOLLOWER_LB_HEALTH_URL" > /dev/null || true
+  done
+
+  if ! after="$(_follower_backend_selections)"; then
+    echo 'unreachable'
+    return
+  fi
+
+  awk '
+    FNR == NR { before[$1] = $2; next }
+    $2 > before[$1] + 0 { used++ }
+    END { print used + 0 }' <(echo "$before") <(echo "$after")
 }
 
 VERIFY_ROWS=''
@@ -1288,17 +1385,25 @@ function _verify {
   # database, so a follower whose replication stopped right afterwards is up,
   # healthy, and serving data that is quietly out of date -- the health row alone
   # calls that environment good.
-  if (( SPEC_FOLLOWERS > 0 )); then
-    _check 'follower health' 'ok' "$(_follower_health)"
-    _check 'follower replication' 'replicating' "$(_follower_replication_state)"
+  #
+  # Per follower, as per standby: one follower down or behind is the finding, and
+  # the number is where to go and look.
+  for number in $(_follower_numbers); do
+    _check "follower $number health" 'ok' "$(_follower_health "$number")"
+    _check "follower $number replication" 'replicating' "$(_follower_replication_state "$number")"
+  done
 
-    # And the end-to-end read, which is the only row that goes through the follower
-    # load balancer and the only one that authenticates. Conditional on the sample
-    # data because that is the secret it looks for; with no sample data there is
-    # nothing to retrieve.
+  if (( SPEC_FOLLOWERS > 0 )); then
+    # And the end-to-end read, which goes through the follower load balancer and is
+    # the only row that authenticates. Conditional on the sample data because that
+    # is the secret it looks for; with no sample data there is nothing to retrieve.
     if [[ "$SPEC_SAMPLE_DATA" == true ]]; then
       _check 'follower secret read' 'retrievable' "$(_follower_secret_state)"
     fi
+
+    # Which is one read, and so one follower. This is the row that says the load
+    # balancer spreads reads across all of them.
+    _check 'follower backends used' "$SPEC_FOLLOWERS" "$(_follower_backends_used)"
   fi
 
   # Whether the leader is clustered at all, as the spec's own true/false: any name

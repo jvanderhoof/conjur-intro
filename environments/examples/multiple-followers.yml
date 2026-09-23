@@ -1,0 +1,43 @@
+# A leader with two followers behind the follower load balancer -- the topology for
+# reproducing anything that depends on reads being spread across a follower tier:
+# an application that sees different answers on different requests, a follower
+# that falls behind while its peers keep up, or a load balancer that quietly
+# stops sending one of them anything.
+#
+#   bin/env --plan environments/examples/multiple-followers.yml
+#   bin/env environments/examples/multiple-followers.yml
+#
+# Everything in leader-and-follower.yml holds for each follower here: each is
+# provisioned, seeded and told to trust its load balancer before any sample data
+# is loaded. They are configured from the one follower seed, and the load
+# balancer's config is generated with a backend per follower, balanced
+# round-robin.
+#
+# Verification reports health and replication for each follower by number, so
+# one that is down or behind is named rather than averaged into the tier. It then
+# reads the sample secret through the load balancer, and asks the load balancer
+# itself which followers it chose across a handful of requests -- a follower that
+# is healthy on its own port but never routed to is otherwise invisible.
+#
+# Three followers is the ceiling: docker-compose.yml defines conjur-follower-1
+# through conjur-follower-3, and a fourth would need a new compose service. The
+# services of followers not asked for stay down.
+#
+# The tier's host ports are 80, 449 and 7001 for the load balancer, and one per
+# follower: 450, then 452 and 453, stepping over 451, which the kubernetes
+# follower uses. Preflight checks them all before pulling anything.
+# CONJUR_FOLLOWER_PORT moves 450; the others are fixed in docker-compose.yml.
+#
+# Quote the version. Unquoted `13.5` is a YAML number, and unquoted `13.10`
+# would silently become 13.1.
+version: "5.0-stable"
+
+leader:
+  standbys: 0
+  auto_failover: false
+
+followers: 2
+
+sample_data: true
+
+# events: []   # reserved seam, deliberately unimplemented -- see the schema

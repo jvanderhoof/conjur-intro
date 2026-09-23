@@ -50,10 +50,10 @@
       }
     },
     "followers": {
-      "description": "Number of followers to deploy behind the follower load balancer. The ceiling is the compose topology's again: docker-compose.yml defines a single conjur-follower-1, and the follower load balancer's generated haproxy.cfg has one backend server, so a second follower needs a new compose service as well as its own backend in that config. More is refused here rather than provisioning one follower and reporting a mismatch for the rest.",
+      "description": "Number of followers to deploy behind the follower load balancer, which is generated with one backend server per follower and balances across them round-robin. The ceiling is the compose topology's again: docker-compose.yml defines conjur-follower-1 through conjur-follower-3, so a fourth follower needs a new compose service, its host in the follower certificate and FOLLOWER_CEILING in bin/utils.sh raised with this maximum. More is refused here rather than provisioning three followers and reporting a mismatch for the rest.",
       "type": "integer",
       "minimum": 0,
-      "maximum": 1,
+      "maximum": 3,
       "default": 0
     },
     "sample_data": {

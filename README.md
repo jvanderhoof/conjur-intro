@@ -121,11 +121,12 @@ To connect to the UI in the browser, use ports 10443(through HA proxy) or 10444(
 |--dry-run|configuration|Only print configuration commands|
 |--enable-auto-failover|action|• Configures Master cluster with auto-failover|Requires configured master and standbys|
 |--enable-mke|action|• Generates a master key<br>• Encrypts and unlocks the Master's server keys with it|Requires configured master, before any standby or follower|
+|--follower-count `<count>`|configuration|Number of followers for `--provision-follower` and `--trust-follower-proxy` (defaults to 1, at most 3)|
 |--generate-dh|configuration|• Disables the mounting of pre-generated DH params inside the master so they're generated on the fly|
 |--help||Shows all available arguments||
 |--import-custom-certificates|action|• Imports pre-generated 3rd-party certificates|Requires configured master|
 |--promote-standby|action|• Stops the current master<br>• Promotes a standby| Requires configured standbys and no auto-failover|
-|--provision-follower|action|• Removes follower if present<br>• Starts a DAP container and a Layer 7 load balancer<br>• Generates a follower seed<br>• Configures follower|Requires configured master|
+|--provision-follower|action|• Removes followers if present<br>• Starts a DAP container per follower and a Layer 7 load balancer across them<br>• Generates a follower seed<br>• Configures each follower|Requires configured master|
 |--provision-k8s-follower|action|• Removes follower if present<br>• Configures follower inside kubernetes cluster ran by kind|Requires configured master|
 |--provision-master|action|• Starts a DAP container and Layer 4 load balancer<br>• Configures with account `demo` and password `MySecretP@ss1`||
 |--provision-standbys|action|• Removes standbys if present<br>• Starts two DAP containers<br>• Generates standby seed files<br>• Configures standbys<br>• Enable Synchronous Standby|Requires configured master|
@@ -135,7 +136,7 @@ To connect to the UI in the browser, use ports 10443(through HA proxy) or 10444(
 |--restore-from-backup|action|• Removes auto-failover (if enabled)<br>• Stops and renames master<br>• Starts new DAP container<br>• Restores master from backup|Requires a previously created backup|
 |--stop|action|Stops and removes all containers||
 |--trigger-failover|action|• Stops current master|Requires an auto-failover cluster|
-|--trust-follower-proxy|action|• Adds Follower load balancer as a trusted proxy|Requires configured follower|
+|--trust-follower-proxy|action|• Adds Follower load balancer as a trusted proxy on each follower|Requires configured followers|
 |--upgrade-master `<version>`|action|• Removes auto-failover (if enabled)<br>• Generates a backup<br>• Stops and removes master<br>• Starts new DAP container<br>• Restores master from backup|Requires configured master|
 |--version `<version>`|configuration|Version of DAP to use (defaults to latest)|
 |--wait-for-dh-params|action|Blocks until the Master has replaced its bootstrap DH parameters with generated ones|Use after `--generate-dh --provision-master`|
@@ -206,12 +207,15 @@ A leader can have up to four standbys, optionally enrolled in an auto-failover
 cluster — which the schema will not accept with fewer than two of them, because
 an etcd cluster of two nodes cannot elect a new leader when it loses one.
 [`environments/examples/highly-available.yml`](environments/examples/highly-available.yml)
-is the smallest such spec. It can also have one follower, provisioned and
-proxy-trusted in the same run and verified on its own health, replication and
-secret retrieval —
-[`environments/examples/leader-and-follower.yml`](environments/examples/leader-and-follower.yml).
-A second follower would need new compose services, so the schema refuses it rather
-than letting `bin/env` quietly build something smaller than you asked for.
+is the smallest such spec. It can also have up to three followers behind the
+follower load balancer, provisioned and proxy-trusted in the same run, each
+verified on its own health and replication, and the tier on a secret read through
+the load balancer and on how many followers it actually routes to —
+[`environments/examples/leader-and-follower.yml`](environments/examples/leader-and-follower.yml)
+and
+[`environments/examples/multiple-followers.yml`](environments/examples/multiple-followers.yml).
+A fourth follower would need a new compose service, so the schema refuses it
+rather than letting `bin/env` quietly build something smaller than you asked for.
 
 The leader can be hardened with three independent booleans — master key
 encryption, custom certificates and generated DH parameters — each applied before
@@ -280,10 +284,11 @@ Usage: bin/dap single [options]
     --dry-run                         Print configuration commands with executing
     --enable-auto-failover            Configures Master cluster with auto-failover (Requires configured master and standbys)
     --enable-mke                      Encrypts the Master's server keys with a master key (Requires configured master, before any standby or follower)
+    --follower-count <count>          Number of followers for --provision-follower and --trust-follower-proxy (defaults to 1, at most 3)
     --h, --help                       Shows this help message
     --import-custom-certificates      Imports pre-generated 3rd-party certificates (Requires configured master)
     --promote-standby                 Stops the current master and promotes a standby (Requires configured standbys and no auto-failover)
-    --provision-follower              Configures follower behind a Layer 7 load balancer (Requires configured master)
+    --provision-follower              Configures followers behind a Layer 7 load balancer (Requires configured master)
     --provision-k8s-follower          Configures follower inside kubernetes cluster ran by kind (Requires configured master)
     --provision-master                Configures a DAP Master with account `demo` and password `MySecretP@ss1` behind a Layer 4 load balancer
     --provision-standbys              Deploys and configures two standbys (Requires configured master)
@@ -294,7 +299,7 @@ Usage: bin/dap single [options]
     --provision-keycloak              Configures Keycloak OIDC authenticator (Requires configured master)
     --stop                            Stops all containers and cleans up cached files
     --trigger-failover                Stops current master (Requires an auto-failover cluster)
-    --trust-follower-proxy            Adds Follower load balancer as a trusted proxy (Requires a configured follower)
+    --trust-follower-proxy            Adds Follower load balancer as a trusted proxy on each follower (Requires configured followers)
     --upgrade-master <version>        Restores master from backup (Requires configured master)
     --version <version>               Version of DAP to use (defaults to latest build)
     --k8s-follower-version <version>  Version of K8S-Follower to use (defaults to latest build)

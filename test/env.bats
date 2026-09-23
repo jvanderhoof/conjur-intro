@@ -14,7 +14,7 @@ setup_file() {
 
   # Build the validator up front so the first test is not timed with a docker
   # build in it.
-  docker build --quiet --tag conjur-intro/env-validator:4 artifacts/env-validator > /dev/null
+  docker build --quiet --tag conjur-intro/env-validator:5 artifacts/env-validator > /dev/null
 }
 
 setup() {
@@ -192,8 +192,8 @@ bin/api --load-sample-policy-and-values' ]
   # and the retrievability check below it would pass on a broken follower.
   [ "$(plan_commands)" = 'bin/dap --version 13.5 --provision-master
 bin/dap --wait-for-master
-bin/dap --version 13.5 --provision-follower
-bin/dap --trust-follower-proxy
+bin/dap --version 13.5 --follower-count 1 --provision-follower
+bin/dap --follower-count 1 --trust-follower-proxy
 bin/api --load-sample-policy-and-values' ]
 }
 
@@ -203,8 +203,8 @@ bin/api --load-sample-policy-and-values' ]
   [ "$status" -eq 0 ]
   [ "$(plan_commands)" = 'bin/dap --version 5.0-stable --provision-master
 bin/dap --wait-for-master
-bin/dap --version 5.0-stable --provision-follower
-bin/dap --trust-follower-proxy
+bin/dap --version 5.0-stable --follower-count 1 --provision-follower
+bin/dap --follower-count 1 --trust-follower-proxy
 bin/api --load-sample-policy-and-values' ]
 }
 
@@ -218,7 +218,7 @@ bin/api --load-sample-policy-and-values' ]
   run bin/env --plan "$SPEC"
 
   [ "$status" -eq 0 ]
-  [[ "$(plan_commands)" == *'bin/dap --version 13.5 --provision-follower'* ]]
+  [[ "$(plan_commands)" == *'bin/dap --version 13.5 --follower-count 1 --provision-follower'* ]]
   [[ "$(plan_commands)" != *'--version 13.5 --trust-follower-proxy'* ]]
 }
 
@@ -236,8 +236,8 @@ bin/api --load-sample-policy-and-values' ]
 bin/dap --wait-for-master
 bin/dap --version 13.5 --standby-count 2 --provision-standbys
 bin/dap --standby-count 2 --enable-auto-failover
-bin/dap --version 13.5 --provision-follower
-bin/dap --trust-follower-proxy
+bin/dap --version 13.5 --follower-count 1 --provision-follower
+bin/dap --follower-count 1 --trust-follower-proxy
 bin/api --load-sample-policy-and-values' ]
 }
 
@@ -257,9 +257,54 @@ bin/api --load-sample-policy-and-values' ]
 
   [ "$status" -eq 0 ]
   [[ "$(plan_checks)" == *'followers running is 1'* ]]
-  [[ "$(plan_checks)" == *'follower /health reports ok'* ]]
-  [[ "$(plan_checks)" == *'follower is replicating from the leader'* ]]
-  [[ "$(plan_checks)" == *'retrievable through the follower'* ]]
+  [[ "$(plan_checks)" == *'follower 1 /health reports ok'* ]]
+  [[ "$(plan_checks)" == *'follower 1 is replicating from the leader'* ]]
+  [[ "$(plan_checks)" == *'retrievable through the follower load balancer'* ]]
+  [[ "$(plan_checks)" == *'follower load balancer routes to 1 follower'* ]]
+}
+
+# Each follower is its own finding, the way each standby is: one that is down or
+# behind has to be named, not averaged into the tier.
+@test "plan mode lists health and replication checks for each follower" {
+  spec 'version: "13.5"' 'followers: 3'
+
+  run bin/env --plan "$SPEC"
+
+  [ "$status" -eq 0 ]
+  [[ "$(plan_checks)" == *'followers running is 3'* ]]
+  [[ "$(plan_checks)" == *'follower 1 /health reports ok'* ]]
+  [[ "$(plan_checks)" == *'follower 2 /health reports ok'* ]]
+  [[ "$(plan_checks)" == *'follower 3 /health reports ok'* ]]
+  [[ "$(plan_checks)" == *'follower 1 is replicating from the leader'* ]]
+  [[ "$(plan_checks)" == *'follower 2 is replicating from the leader'* ]]
+  [[ "$(plan_checks)" == *'follower 3 is replicating from the leader'* ]]
+  [[ "$(plan_checks)" == *'follower load balancer routes to 3 followers'* ]]
+}
+
+@test "every follower asked for is provisioned, and trusts its load balancer" {
+  spec 'version: "13.5"' 'followers: 2'
+
+  run bin/env --plan "$SPEC"
+
+  [ "$status" -eq 0 ]
+  [ "$(plan_commands)" = 'bin/dap --version 13.5 --provision-master
+bin/dap --wait-for-master
+bin/dap --version 13.5 --follower-count 2 --provision-follower
+bin/dap --follower-count 2 --trust-follower-proxy
+bin/api --load-sample-policy-and-values' ]
+}
+
+@test "the tracked multiple-followers example plans two followers behind the load balancer" {
+  run bin/env --plan environments/examples/multiple-followers.yml
+
+  [ "$status" -eq 0 ]
+  [ "$(plan_commands)" = 'bin/dap --version 5.0-stable --provision-master
+bin/dap --wait-for-master
+bin/dap --version 5.0-stable --follower-count 2 --provision-follower
+bin/dap --follower-count 2 --trust-follower-proxy
+bin/api --load-sample-policy-and-values' ]
+  [[ "$(plan_checks)" == *'follower 2 is replicating from the leader'* ]]
+  [[ "$(plan_checks)" == *'follower load balancer routes to 2 followers'* ]]
 }
 
 @test "a spec with no follower lists no follower checks beyond the count" {
@@ -269,8 +314,8 @@ bin/api --load-sample-policy-and-values' ]
 
   [ "$status" -eq 0 ]
   [[ "$(plan_checks)" == *'followers running is 0'* ]]
-  [[ "$(plan_checks)" != *'follower /health'* ]]
-  [[ "$(plan_checks)" != *'through the follower'* ]]
+  [[ "$(plan_checks)" != *'follower 1'* ]]
+  [[ "$(plan_checks)" != *'follower load balancer'* ]]
 }
 
 @test "the follower tier's own host ports are part of preflight" {
@@ -284,6 +329,17 @@ bin/api --load-sample-policy-and-values' ]
   # appliance published directly. Grouped after the leader's rather than sorted in,
   # so the list reads as one tier then the other.
   [[ "$(plan_preflight)" == *'host ports 443, 444, 7000, 80, 449, 450, 7001 are free'* ]]
+}
+
+# docker-compose.yml publishes follower 1 on CONJUR_FOLLOWER_PORT and the others on
+# 450 plus their number, stepping over 451 -- CONJUR_K8S_FOLLOWER_PORT's default.
+@test "each follower's own host port is part of preflight" {
+  spec 'version: "13.5"' 'followers: 3'
+
+  run bin/env --plan "$SPEC"
+
+  [ "$status" -eq 0 ]
+  [[ "$(plan_preflight)" == *'host ports 443, 444, 7000, 80, 449, 450, 452, 453, 7001 are free'* ]]
 }
 
 @test "the follower ports stay out of preflight when no follower is asked for" {
@@ -397,8 +453,8 @@ bin/dap --wait-for-master
 bin/dap --wait-for-dh-params
 bin/dap --version 13.5 --standby-count 2 --provision-standbys
 bin/dap --standby-count 2 --enable-auto-failover
-bin/dap --version 13.5 --provision-follower
-bin/dap --trust-follower-proxy
+bin/dap --version 13.5 --follower-count 1 --provision-follower
+bin/dap --follower-count 1 --trust-follower-proxy
 bin/api --load-sample-policy-and-values' ]
 }
 
@@ -413,8 +469,8 @@ bin/dap --enable-mke
 bin/dap --wait-for-master
 bin/dap --version 5.0-stable --standby-count 2 --provision-standbys
 bin/dap --standby-count 2 --enable-auto-failover
-bin/dap --version 5.0-stable --provision-follower
-bin/dap --trust-follower-proxy
+bin/dap --version 5.0-stable --follower-count 1 --provision-follower
+bin/dap --follower-count 1 --trust-follower-proxy
 bin/api --load-sample-policy-and-values' ]
 }
 
@@ -779,26 +835,25 @@ bin/api --load-sample-policy-and-values' ]
 #
 ## The follower tier -- how far the schema lets a spec go
 #
-# Same mechanism again, one tier down. docker-compose.yml defines a single
-# conjur-follower-1, and the follower load balancer's generated haproxy.cfg has
-# one backend, so a second follower needs its own backend as well as a new compose
-# service. Two is refused here rather than provisioning one follower and
+# Same mechanism again, one tier down. docker-compose.yml defines
+# conjur-follower-1 through conjur-follower-3, so a fourth follower would need a
+# new compose service. Four is refused here rather than provisioning three and
 # reporting a mismatch for the other.
 
 @test "more followers than the compose topology defines is a schema error" {
-  spec 'version: "13.5"' 'followers: 2'
+  spec 'version: "13.5"' 'followers: 4'
 
   run bin/env --plan "$SPEC"
 
   [ "$status" -ne 0 ]
   [[ "$output" == *'/followers'* ]]
-  [[ "$output" == *'maximum of 1'* ]]
-  [[ "$output" == *'conjur-follower-1'* ]]
+  [[ "$output" == *'maximum of 3'* ]]
+  [[ "$output" == *'conjur-follower-3'* ]]
   [[ "$output" == *'nothing was provisioned'* ]]
 }
 
 @test "the largest follower count the compose topology supports validates" {
-  spec 'version: "13.5"' 'followers: 1'
+  spec 'version: "13.5"' 'followers: 3'
 
   run bin/env --plan "$SPEC"
 
@@ -808,9 +863,10 @@ bin/api --load-sample-policy-and-values' ]
 #
 ## The follower load balancer's config
 #
-# Generated at provisioning time, the way the leader's is, so that a second
-# follower only changes how many backends are emitted. bin/dap and
-# bin/podman-dap both mount it, so the generator lives in bin/utils.sh.
+# Generated at provisioning time, the way the leader's is, with one backend per
+# follower. bin/dap and bin/podman-dap both mount it, so the generator lives in
+# bin/utils.sh, and reads the count from FOLLOWER_COUNT -- bin/dap's
+# --follower-count -- defaulting to the single follower bin/podman-dap builds.
 
 # The server lines of the follower load balancer's www-backend.
 follower_backend_servers() {
@@ -819,7 +875,7 @@ follower_backend_servers() {
     | grep '^  server '
 }
 
-@test "the follower load balancer's config has exactly one backend, conjur-follower-1" {
+@test "the follower load balancer's config has one backend by default, conjur-follower-1" {
   run follower_backend_servers
 
   [ "$status" -eq 0 ]
@@ -827,12 +883,32 @@ follower_backend_servers() {
   [[ "${lines[0]}" == '  server conjur-follower-1 conjur-follower-1.mycompany.local:443 '* ]]
 }
 
-@test "the follower backend is health-checked and verified against the leader's CA" {
-  run follower_backend_servers
+@test "the follower load balancer's config has a backend per follower asked for" {
+  FOLLOWER_COUNT=3 run follower_backend_servers
 
-  [[ "${lines[0]}" == *' check port 443 '* ]]
-  [[ "${lines[0]}" == *' check-ssl ca-file /etc/ssl/certs/ca.pem '* ]]
-  [[ "${lines[0]}" == *' ssl ca-file /etc/ssl/certs/ca.pem '* ]]
+  [ "$status" -eq 0 ]
+  [ "${#lines[@]}" -eq 3 ]
+  [[ "${lines[0]}" == '  server conjur-follower-1 conjur-follower-1.mycompany.local:443 '* ]]
+  [[ "${lines[1]}" == '  server conjur-follower-2 conjur-follower-2.mycompany.local:443 '* ]]
+  [[ "${lines[2]}" == '  server conjur-follower-3 conjur-follower-3.mycompany.local:443 '* ]]
+}
+
+# The whole line rather than fragments of it: every option once. It used to carry
+# `check port 443` twice and `ca-file` twice, which HAProxy accepted silently --
+# and which a fragment match passes either way. check-ssl takes its CA from the
+# server's own `ca-file`, so the one covers both the traffic and the health check.
+@test "the follower backend is health-checked and verified against the leader's CA" {
+  FOLLOWER_COUNT=2 run follower_backend_servers
+
+  [ "${lines[0]}" = '  server conjur-follower-1 conjur-follower-1.mycompany.local:443 check port 443 check-ssl ssl ca-file /etc/ssl/certs/ca.pem resolvers docker init-addr none' ]
+  [ "${lines[1]}" = '  server conjur-follower-2 conjur-follower-2.mycompany.local:443 check port 443 check-ssl ssl ca-file /etc/ssl/certs/ca.pem resolvers docker init-addr none' ]
+}
+
+@test "the follower load balancer balances its backends round-robin" {
+  source bin/utils.sh
+  run _follower_proxy_config
+
+  [[ "$output" == *$'backend www-backend\n  balance roundrobin\n'* ]]
 }
 
 # The load balancer starts before the follower is necessarily resolvable, so
@@ -861,6 +937,79 @@ follower_backend_servers() {
   _set_follower_proxy_config "$dir"
 
   [ "$(cat "$dir/haproxy.cfg")" = "$(_follower_proxy_config)" ]
+}
+
+# bin/dap itself, one level below bin/env's plan: that --follower-count brings up
+# the followers asked for and only those. It runs against a docker that records
+# what it was asked to do and does nothing, and under --dry-run, which makes
+# bin/dap echo what it would run inside a container rather than run it. Neither
+# is enough alone: --dry-run still starts and removes compose services for real.
+
+# Runs bin/dap with the given arguments against a docker that logs every call to
+# $DOCKER_LOG. `docker compose exec` fails, which is what bin/dap reads as the
+# leader having no master key, so the MKE steps stay out of the way.
+run_dap_with_fake_docker() {
+  mkdir -p "$BATS_TEST_TMPDIR/bin"
+  DOCKER_LOG="$BATS_TEST_TMPDIR/docker.log"
+  cat > "$BATS_TEST_TMPDIR/bin/docker" << EOF
+#!/usr/bin/env bash
+echo "docker \$*" >> "$DOCKER_LOG"
+[[ "\$1 \$2" != 'compose exec' ]]
+EOF
+  chmod +x "$BATS_TEST_TMPDIR/bin/docker"
+  PATH="$BATS_TEST_TMPDIR/bin:$PATH" run bin/dap --dry-run "$@"
+}
+
+@test "bin/dap --provision-follower starts only the followers asked for" {
+  run_dap_with_fake_docker --follower-count 2 --provision-follower
+
+  [ "$status" -eq 0 ]
+  grep -qx 'docker compose up --no-deps --detach conjur-follower-1.mycompany.local' "$DOCKER_LOG"
+  grep -qx 'docker compose up --no-deps --detach conjur-follower-2.mycompany.local' "$DOCKER_LOG"
+  ! grep -q 'conjur-follower-3' "$DOCKER_LOG"
+}
+
+# One seed, so that the leader's master key is decrypted and re-encrypted once
+# however many followers there are -- but a copy of it per follower, because
+# `evoke unpack seed` removes the file it unpacks. Followers sharing one file got as
+# far as the second, which found nothing to unpack.
+@test "bin/dap --provision-follower configures every follower from its own copy of one seed" {
+  run_dap_with_fake_docker --follower-count 2 --provision-follower
+
+  [ "$status" -eq 0 ]
+  [ "$(grep -c 'evoke seed follower' <<< "$output")" -eq 1 ]
+  [[ "$output" == *'(on conjur-master-1.mycompany.local): docker exec cyberark-dap set -o pipefail; evoke seed follower conjur-follower.mycompany.local | tee /opt/cyberark/dap/seeds/follower-seed-1.tar /opt/cyberark/dap/seeds/follower-seed-2.tar > /dev/null'* ]]
+  [[ "$output" == *'(on conjur-follower-1.mycompany.local): docker exec cyberark-dap evoke unpack seed /opt/cyberark/dap/seeds/follower-seed-1.tar && evoke configure follower'* ]]
+  [[ "$output" == *'(on conjur-follower-2.mycompany.local): docker exec cyberark-dap evoke unpack seed /opt/cyberark/dap/seeds/follower-seed-2.tar && evoke configure follower'* ]]
+  [[ "$output" != *'on conjur-follower-3'* ]]
+  [[ "$output" != *'follower-seed-3'* ]]
+}
+
+# The follower-certs volume is shared by follower 1 and the load balancer only;
+# the load balancer's certificate is copied out of follower 1 and nowhere else.
+@test "bin/dap --provision-follower copies the load balancer's certificate from follower 1 alone" {
+  run_dap_with_fake_docker --follower-count 3 --provision-follower
+
+  [ "$status" -eq 0 ]
+  [ "$(grep -c 'conjur-follower.mycompany.local.pem' <<< "$output")" -eq 3 ]
+  [ "$(grep 'conjur-follower.mycompany.local.pem' <<< "$output" | grep -vc 'on conjur-follower-1.mycompany.local')" -eq 0 ]
+}
+
+@test "bin/dap --provision-follower defaults to the one follower" {
+  run_dap_with_fake_docker --provision-follower
+
+  [ "$status" -eq 0 ]
+  grep -qx 'docker compose up --no-deps --detach conjur-follower-1.mycompany.local' "$DOCKER_LOG"
+  ! grep -q 'conjur-follower-2' "$DOCKER_LOG"
+}
+
+@test "bin/dap --trust-follower-proxy trusts the load balancer on every follower" {
+  run_dap_with_fake_docker --follower-count 3 --trust-follower-proxy
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'(on conjur-follower-1.mycompany.local): docker exec cyberark-dap evoke proxy add 12.16.23.16'* ]]
+  [[ "$output" == *'(on conjur-follower-2.mycompany.local): docker exec cyberark-dap evoke proxy add 12.16.23.16'* ]]
+  [[ "$output" == *'(on conjur-follower-3.mycompany.local): docker exec cyberark-dap evoke proxy add 12.16.23.16'* ]]
 }
 
 #
@@ -1463,6 +1612,9 @@ JSON
   _running_followers() {
     echo 1
   }
+  _follower_backends_used() {
+    echo 1
+  }
   _follower_health() {
     echo ok
   }
@@ -1492,9 +1644,10 @@ JSON
   # to be capable of passing and not only of mismatching.
   [ "$status" -eq 0 ]
   [[ "$(rows)" == *'followers running 1 1 ok'* ]]
-  [[ "$(rows)" == *'follower health ok ok ok'* ]]
-  [[ "$(rows)" == *'follower replication replicating replicating ok'* ]]
+  [[ "$(rows)" == *'follower 1 health ok ok ok'* ]]
+  [[ "$(rows)" == *'follower 1 replication replicating replicating ok'* ]]
   [[ "$(rows)" == *'follower secret read retrievable retrievable ok'* ]]
+  [[ "$(rows)" == *'follower backends used 1 1 ok'* ]]
 }
 
 @test "a follower that is up but behind fails verification while the leader passes" {
@@ -1508,6 +1661,9 @@ JSON
   # -- every other row is stubbed to pass, which is what makes the non-zero status
   # below say something about the follower rather than about an unstubbed probe.
   _running_followers() {
+    echo 1
+  }
+  _follower_backends_used() {
     echo 1
   }
   _follower_health() {
@@ -1538,8 +1694,8 @@ JSON
   [ "$status" -ne 0 ]
   [ "$(rows | grep --count MISMATCH)" -eq 1 ]
   [[ "$(rows)" == *'leader health ok ok ok'* ]]
-  [[ "$(rows)" == *'follower health ok ok ok'* ]]
-  [[ "$(rows)" == *'follower replication replicating apply errors MISMATCH'* ]]
+  [[ "$(rows)" == *'follower 1 health ok ok ok'* ]]
+  [[ "$(rows)" == *'follower 1 replication replicating apply errors MISMATCH'* ]]
 }
 
 @test "a follower serving a stale snapshot is caught even though the secret reads back" {
@@ -1552,6 +1708,9 @@ JSON
   # replication stopped straight afterwards still answers for every secret that
   # existed at seed time. Retrievability alone would report this environment as good.
   _running_followers() {
+    echo 1
+  }
+  _follower_backends_used() {
     echo 1
   }
   _follower_health() {
@@ -1582,7 +1741,131 @@ JSON
   [ "$status" -ne 0 ]
   [ "$(rows | grep --count MISMATCH)" -eq 1 ]
   [[ "$(rows)" == *'follower secret read retrievable retrievable ok'* ]]
-  [[ "$(rows)" == *'follower replication replicating disabled MISMATCH'* ]]
+  [[ "$(rows)" == *'follower 1 replication replicating disabled MISMATCH'* ]]
+}
+
+# Stubs a leader with no standbys and the sample data loaded, and $1 followers that
+# are all up, healthy, replicating and routed to -- for the multi-follower tests,
+# which then override the one probe each is about.
+stub_healthy_followers() {
+  local count="$1"
+
+  eval "_running_followers() { echo $count; }"
+  eval "_follower_backends_used() { echo $count; }"
+  _follower_health() {
+    echo ok
+  }
+  _follower_replication_state() {
+    echo replicating
+  }
+  _follower_secret_state() {
+    echo retrievable
+  }
+  _running_standbys() {
+    echo 0
+  }
+  _leader_health() {
+    echo ok
+  }
+  _leader_cluster_name() {
+    echo none
+  }
+  _leader_image_tag() {
+    echo 13.5
+  }
+  stub_unhardened_leader
+  _sample_data_state() {
+    echo loaded
+  }
+}
+
+@test "verification reports health and replication for each follower" {
+  spec 'version: "13.5"' 'followers: 3'
+
+  BIN_ENV_SOURCE_ONLY=1 source bin/env
+  _read_spec "$(_resolve_spec "$SPEC")"
+  stub_healthy_followers 3
+
+  run _verify
+
+  [ "$status" -eq 0 ]
+  [[ "$(rows)" == *'followers running 3 3 ok'* ]]
+  [[ "$(rows)" == *'follower 1 health ok ok ok'* ]]
+  [[ "$(rows)" == *'follower 2 health ok ok ok'* ]]
+  [[ "$(rows)" == *'follower 3 health ok ok ok'* ]]
+  [[ "$(rows)" == *'follower 1 replication replicating replicating ok'* ]]
+  [[ "$(rows)" == *'follower 2 replication replicating replicating ok'* ]]
+  [[ "$(rows)" == *'follower 3 replication replicating replicating ok'* ]]
+  [[ "$(rows)" == *'follower secret read retrievable retrievable ok'* ]]
+  [[ "$(rows)" == *'follower backends used 3 3 ok'* ]]
+}
+
+# The probes are asked by number, so that a stub answering for every follower
+# alike could not hide one that is not being asked at all.
+@test "one unhealthy follower fails verification, and is the one named" {
+  spec 'version: "13.5"' 'followers: 3'
+
+  BIN_ENV_SOURCE_ONLY=1 source bin/env
+  _read_spec "$(_resolve_spec "$SPEC")"
+  stub_healthy_followers 3
+  _follower_health() {
+    if [ "$1" = 2 ]; then
+      echo 'not ok'
+    else
+      echo ok
+    fi
+  }
+
+  run _verify
+
+  [ "$status" -ne 0 ]
+  [ "$(rows | grep --count MISMATCH)" -eq 1 ]
+  [[ "$(rows)" == *'follower 1 health ok ok ok'* ]]
+  [[ "$(rows)" == *'follower 2 health ok not ok MISMATCH'* ]]
+  [[ "$(rows)" == *'follower 3 health ok ok ok'* ]]
+}
+
+@test "one follower behind fails verification, and is the one named" {
+  spec 'version: "13.5"' 'followers: 2'
+
+  BIN_ENV_SOURCE_ONLY=1 source bin/env
+  _read_spec "$(_resolve_spec "$SPEC")"
+  stub_healthy_followers 2
+  _follower_replication_state() {
+    if [ "$1" = 2 ]; then
+      echo 'initial sync'
+    else
+      echo replicating
+    fi
+  }
+
+  run _verify
+
+  [ "$status" -ne 0 ]
+  [ "$(rows | grep --count MISMATCH)" -eq 1 ]
+  [[ "$(rows)" == *'follower 1 replication replicating replicating ok'* ]]
+  [[ "$(rows)" == *'follower 2 replication replicating initial sync MISMATCH'* ]]
+}
+
+# Every follower healthy and replicating on its own port says nothing about the
+# load balancer in front of them: a backend it never marks up -- a certificate it
+# cannot verify, say -- leaves the tier serving from fewer followers than it has,
+# with every other row passing.
+@test "a load balancer routing to fewer followers than there are fails verification" {
+  spec 'version: "13.5"' 'followers: 2'
+
+  BIN_ENV_SOURCE_ONLY=1 source bin/env
+  _read_spec "$(_resolve_spec "$SPEC")"
+  stub_healthy_followers 2
+  _follower_backends_used() {
+    echo 1
+  }
+
+  run _verify
+
+  [ "$status" -ne 0 ]
+  [ "$(rows | grep --count MISMATCH)" -eq 1 ]
+  [[ "$(rows)" == *'follower backends used 2 1 MISMATCH'* ]]
 }
 
 @test "a follower the spec did not ask for gets no follower rows beyond the count" {
@@ -1596,6 +1879,9 @@ JSON
   # the health, replication or retrieval rows to be desired against. Every other row
   # is stubbed to pass, so that none of them reaches a real curl or docker.
   _running_followers() {
+    echo 1
+  }
+  _follower_backends_used() {
     echo 1
   }
   _running_standbys() {
@@ -1616,9 +1902,10 @@ JSON
 
   [ "$status" -ne 0 ]
   [[ "$(rows)" == *'followers running 0 1 MISMATCH'* ]]
-  [[ "$(rows)" != *'follower health'* ]]
-  [[ "$(rows)" != *'follower replication'* ]]
+  [[ "$(rows)" != *'follower 1 health'* ]]
+  [[ "$(rows)" != *'follower 1 replication'* ]]
   [[ "$(rows)" != *'follower secret read'* ]]
+  [[ "$(rows)" != *'follower backends used'* ]]
 }
 
 # Retrieval through the follower is a claim about the sample data, so it only means
@@ -1630,6 +1917,9 @@ JSON
   _read_spec "$(_resolve_spec "$SPEC")"
 
   _running_followers() {
+    echo 1
+  }
+  _follower_backends_used() {
     echo 1
   }
   _follower_health() {
@@ -1657,8 +1947,8 @@ JSON
   # A clean exit as well as the missing row, since a retrieval row that was still
   # probed and failed would otherwise go unnoticed.
   [ "$status" -eq 0 ]
-  [[ "$(rows)" == *'follower health ok ok ok'* ]]
-  [[ "$(rows)" == *'follower replication replicating replicating ok'* ]]
+  [[ "$(rows)" == *'follower 1 health ok ok ok'* ]]
+  [[ "$(rows)" == *'follower 1 replication replicating replicating ok'* ]]
   [[ "$(rows)" != *'follower secret read'* ]]
 }
 
@@ -2297,7 +2587,7 @@ PEM
     esac
   }
 
-  [ "$(_follower_health)" = 'ok' ]
+  [ "$(_follower_health 1)" = 'ok' ]
 
   # Only the follower is unhealthy. A probe reading the leader's answer would still
   # say ok here, which is the whole point of the check.
@@ -2309,7 +2599,7 @@ PEM
     esac
   }
 
-  [ "$(_follower_health)" = 'not ok' ]
+  [ "$(_follower_health 1)" = 'not ok' ]
   [ "$(_leader_health)" = 'ok' ]
 
   # And the follower down while the leader is up, which is the state the whole row
@@ -2321,7 +2611,29 @@ PEM
     esac
   }
 
-  [ "$(_follower_health)" = 'unreachable' ]
+  [ "$(_follower_health 1)" = 'unreachable' ]
+}
+
+# Each follower on its own published port, as docker-compose.yml has it: follower 1
+# on CONJUR_FOLLOWER_PORT, the others on 450 plus their number.
+@test "each follower is probed on its own port" {
+  BIN_ENV_SOURCE_ONLY=1 source bin/env
+
+  curl() {
+    case "$*" in
+      *localhost:450/* ) echo '{"ok":true,"role":"follower"}' ;;
+      *localhost:452/* ) echo '{"ok":false,"role":"follower"}' ;;
+      * ) return 7 ;;
+    esac
+  }
+
+  [ "$(_follower_health 1)" = 'ok' ]
+  [ "$(_follower_health 2)" = 'not ok' ]
+  [ "$(_follower_health 3)" = 'unreachable' ]
+
+  CONJUR_FOLLOWER_PORT=460
+  [ "$(_follower_health 1)" = 'unreachable' ]
+  [ "$(_follower_health 2)" = 'not ok' ]
 }
 
 # Followers replicate logically, over pglogical subscriptions, so there is no row
@@ -2386,13 +2698,13 @@ JSON
     esac
   }
 
-  [ "$(_follower_replication_state)" = 'replicating' ]
+  [ "$(_follower_replication_state 1)" = 'replicating' ]
 
   # The same probe pointed at the leader, which is the mistake this guards against.
   # Verified live as well: it reads `not a follower` against conjur-master-1.
   CONJUR_FOLLOWER_PORT="$CONJUR_MASTER_PORT"
 
-  [ "$(_follower_replication_state)" = 'not a follower' ]
+  [ "$(_follower_replication_state 1)" = 'not a follower' ]
 }
 
 # The failure cases, each derived from the captured body above by changing only the
@@ -2411,31 +2723,31 @@ JSON
   # Configured as a follower, subscribed to nothing: what a follower brought up
   # without `evoke configure follower` ever completing looks like.
   curl() { follower_health_body '[]'; }
-  [ "$(_follower_replication_state)" = 'not replicating' ]
+  [ "$(_follower_replication_state 1)" = 'not replicating' ]
 
   # Still copying the leader's database. Reported as its own state rather than as a
   # failure of replication, because it is a stage every follower passes through.
   curl() { follower_health_body '[{"enabled":true,"apply_error_count":0,"sync_error_count":0}]' true; }
-  [ "$(_follower_replication_state)" = 'initial sync' ]
+  [ "$(_follower_replication_state 1)" = 'initial sync' ]
 
   # The subscription exists but is not running, which is what `evoke replication
   # stop` leaves behind -- and the state in which the follower keeps serving the
   # data it already has.
   curl() { follower_health_body '[{"enabled":false,"apply_error_count":0,"sync_error_count":0}]'; }
-  [ "$(_follower_replication_state)" = 'disabled' ]
+  [ "$(_follower_replication_state 1)" = 'disabled' ]
 
   # Receiving changes and failing to apply them. This is the case the leader's own
   # pg_stat_replication would call `streaming`.
   curl() { follower_health_body '[{"enabled":true,"apply_error_count":3,"sync_error_count":0}]'; }
-  [ "$(_follower_replication_state)" = 'apply errors' ]
+  [ "$(_follower_replication_state 1)" = 'apply errors' ]
 
   curl() { follower_health_body '[{"enabled":true,"apply_error_count":0,"sync_error_count":2}]'; }
-  [ "$(_follower_replication_state)" = 'sync errors' ]
+  [ "$(_follower_replication_state 1)" = 'sync errors' ]
 
   # No replication block at all, which is what an older appliance answers. Distinct
   # from every state above: the probe has no view, rather than a bad one.
   curl() { echo '{"ok":true,"role":"follower","database":{"ok":true}}'; }
-  [ "$(_follower_replication_state)" = 'unparseable' ]
+  [ "$(_follower_replication_state 1)" = 'unparseable' ]
 }
 
 @test "sample data is verified by retrieving a secret, not by the fetch succeeding" {
@@ -2517,6 +2829,99 @@ JSON
   }
 
   [ "$(_follower_secret_state)" = 'not retrievable' ]
+}
+
+# The follower load balancer's stats page, as HAProxy 3.4 served it for a tier of
+# two followers. Its columns are read by name rather than position, so that is
+# what this pins: the real header, with the frontend, backend and stats rows that
+# have to be told apart from the servers.
+follower_lb_stats_csv() {
+  cat << 'CSV'
+# pxname,svname,qcur,qmax,scur,smax,slim,stot,bin,bout,dreq,dresp,ereq,econ,eresp,wretr,wredis,status,weight,act,bck,chkfail,chkdown,lastchg,downtime,qlimit,pid,iid,sid,throttle,lbtot,tracked,type,rate,rate_lim,rate_max,check_status,check_code,check_duration,hrsp_1xx,hrsp_2xx,hrsp_3xx,hrsp_4xx,hrsp_5xx,hrsp_other,hanafail,req_rate,req_rate_max,req_tot,cli_abrt,srv_abrt,comp_in,comp_out,comp_byp,comp_rsp,lastsess,last_chk,last_agt,qtime,ctime,rtime,ttime,agent_status,agent_code,agent_duration,check_desc,agent_desc,check_rise,check_fall,check_health,agent_rise,agent_fall,agent_health,addr,cookie,mode,algo,conn_rate,conn_rate_max,conn_tot,intercepted,dcon,dses,wrew,connect,reuse,cache_lookups,cache_hits,srv_icur,src_ilim,qtime_max,ctime_max,rtime_max,ttime_max,eint,idle_conn_cur,safe_conn_cur,used_conn_cur,need_conn_est,uweight,agg_server_status,agg_server_check_status,agg_check_status,srid,sess_other,h1sess,h2sess,h3sess,req_other,h1req,h2req,h3req,proto,priv_idle_cur,reqbin,reqbout,resbin,resbout,-,ssl_sess,ssl_reused_sess,ssl_failed_handshake,ssl_ocsp_staple,ssl_failed_ocsp_staple,h3_data,h3_headers,h3_cancel_push,h3_push_promise,h3_max_push_id,h3_goaway,h3_settings,h3_no_error,h3_general_protocol_error,h3_internal_error,h3_stream_creation_error,h3_closed_critical_stream,h3_frame_unexpected,h3_frame_error,h3_excessive_load,h3_id_error,h3_settings_error,h3_missing_settings,h3_request_rejected,h3_request_cancelled,h3_request_incomplete,h3_message_error,h3_connect_error,h3_version_fallback,pack_decompression_failed,qpack_encoder_stream_error,qpack_decoder_stream_error,quic_rxbuf_full,quic_dropped_pkt,quic_dropped_pkt_bufoverrun,quic_dropped_parsing_pkt,quic_socket_full,quic_sendto_err,quic_sendto_err_unknwn,quic_sent_pkt,quic_lost_pkt,quic_too_short_dgram,quic_retry_sent,quic_retry_validated,quic_retry_error,quic_half_open_conn,quic_hdshk_fail,quic_stless_rst_sent,quic_conn_migration_done,quic_transp_err_no_error,quic_transp_err_internal_error,quic_transp_err_connection_refused,quic_transp_err_flow_control_error,quic_transp_err_stream_limit_error,quic_transp_err_stream_state_error,quic_transp_err_final_size_error,quic_transp_err_frame_encoding_error,quic_transp_err_transport_parameter_error,quic_transp_err_connection_id_limit,quic_transp_err_protocol_violation_error,quic_transp_err_invalid_token,quic_transp_err_application_error,quic_transp_err_crypto_buffer_exceeded,quic_transp_err_key_update_error,quic_transp_err_aead_limit_reached,quic_transp_err_no_viable_path,quic_transp_err_crypto_error,quic_transp_err_unknown_error,quic_data_blocked,quic_stream_data_blocked,quic_streams_blocked_bidi,quic_streams_blocked_uni,quic_ncbuf_gap_limit,h2_headers_rcvd,h2_data_rcvd,h2_settings_rcvd,h2_rst_stream_rcvd,h2_goaway_rcvd,h2_detected_conn_protocol_errors,h2_detected_strm_protocol_errors,h2_rst_stream_resp,h2_goaway_resp,h2_open_connections,h2_backend_open_streams,h2_total_connections,h2_backend_total_streams,h1_open_connections,h1_open_streams,h1_total_connections,h1_total_streams,h1_bytes_in,h1_bytes_out,h1_spliced_bytes_in,h1_spliced_bytes_out,
+www,FRONTEND,,,0,3,256,7,2106,11429,0,0,0,,,,,OPEN,,,,,,,,,1,2,0,,,,0,0,0,7,,,,0,7,0,0,0,0,,0,7,7,,,0,0,0,0,,,,,,,,,,,,,,,,,,,,,http,,0,7,7,0,0,0,0,,,0,0,,,,,,,0,,,,,,,,,,0,2,5,0,0,2,5,0,,,2106,2289,11429,11429,-,5,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,5,0,15,0,1,0,0,0,0,0,0,5,5,0,0,2,2,437,2323,0,0,
+www-backend,conjur-follower-1,0,0,0,1,,3,478,5632,,0,,0,0,0,0,UP,1,1,0,1,2,34,8,,1,3,1,,3,,2,0,,3,L7OK,200,58,0,3,0,0,0,0,,,,3,0,0,,,,,9,,,0,2,9,12,,,,Layer7 check passed,,2,3,4,,,,,,http,,,,,,,,0,3,0,,,0,,0,2,26,27,0,0,0,0,1,1,,,,0,,,,,,,,,,0,478,557,5632,5632,-,23,1,0,0,0,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,
+www-backend,conjur-follower-2,0,0,0,1,,4,1628,5797,,0,,0,0,0,0,UP,1,1,0,2,1,44,0,,1,3,2,,4,,2,0,,4,L7OK,200,63,0,4,0,0,0,0,,,,4,0,0,,,,,9,,,0,2,69,72,,,,Layer7 check passed,,2,3,4,,,,,,http,,,,,,,,0,2,2,,,0,,0,3,225,228,0,0,0,0,1,1,,,,0,,,,,,,,,,0,1628,1732,5797,5797,-,23,0,0,0,0,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,
+www-backend,BACKEND,0,0,0,1,26,7,2106,11429,0,0,,0,0,0,0,UP,2,2,0,,1,44,0,,1,3,0,,7,,1,0,,7,,,,0,7,0,0,0,0,,,,7,0,0,0,0,0,0,9,,,0,2,44,46,,,,,,,,,,,,,,http,,,,,,,,0,5,2,0,0,,,0,3,225,228,0,,,,,2,0,0,0,,,,,,,,,,,,2106,2289,11429,11429,-,46,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,47,49,102090,3201,0,0,
+stats,FRONTEND,,,1,2,256,3,168,11114,0,0,0,,,,,OPEN,,,,,,,,,1,4,0,,,,0,1,0,2,,,,0,2,0,0,0,0,,1,2,3,,,0,0,0,0,,,,,,,,,,,,,,,,,,,,,http,,1,2,3,3,0,0,0,,,0,0,,,,,,,0,,,,,,,,,,0,3,0,0,0,3,0,0,,,168,168,11114,11114,-,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,3,3,243,11134,0,0,
+stats,BACKEND,0,0,0,0,26,0,168,11114,0,0,,0,0,0,0,UP,0,0,0,,0,44,,,1,4,0,,0,,1,0,,0,,,,0,0,0,0,0,0,,,,0,0,0,0,0,0,0,0,,,0,0,0,0,,,,,,,,,,,,,,http,,,,,,,,0,0,0,0,0,,,0,0,0,0,0,,,,,0,0,0,0,,,,,,,,,,,,168,168,11114,11114,-,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+CSV
+}
+
+# A follower load balancer with the given servers up behind it, balancing
+# round-robin across them, with each server's lbtot -- the times HAProxy chose it
+# -- kept in a file so the counts survive the subshells the probe runs curl in.
+# The stats page is the captured one with those counts written into it.
+stub_follower_load_balancer() {
+  printf '%s\n' "$@" > "$BATS_TEST_TMPDIR/lb-servers"
+  echo 0 > "$BATS_TEST_TMPDIR/lb-next"
+
+  curl() {
+    case "$*" in
+      *'localhost:7001/;csv'* )
+        follower_lb_stats_csv | awk -F, -v OFS=, -v dir="$BATS_TEST_TMPDIR" '
+          $1 == "www-backend" && $2 ~ /^conjur-follower-/ {
+            total = 0
+            if ((getline total < (dir "/lbtot-" $2)) <= 0) total = 0
+            $31 = total
+          }
+          { print }'
+        ;;
+      *'localhost:449/health'* )
+        local servers next server total
+        mapfile -t servers < "$BATS_TEST_TMPDIR/lb-servers"
+        next="$(cat "$BATS_TEST_TMPDIR/lb-next")"
+        server="${servers[next % ${#servers[@]}]}"
+        total="$(cat "$BATS_TEST_TMPDIR/lbtot-$server" 2> /dev/null || echo 0)"
+        echo $((total + 1)) > "$BATS_TEST_TMPDIR/lbtot-$server"
+        echo $((next + 1)) > "$BATS_TEST_TMPDIR/lb-next"
+        echo '{"ok":true}'
+        ;;
+      * ) return 7 ;;
+    esac
+  }
+}
+
+# Counted off the load balancer's own record of which servers it chose, across
+# requests made through it, rather than off the followers: a follower answering
+# on its own port says nothing about whether the load balancer ever sends it
+# anything.
+@test "the backends used are the followers the load balancer chose for requests through it" {
+  BIN_ENV_SOURCE_ONLY=1 source bin/env
+  SPEC_FOLLOWERS=2
+  stub_follower_load_balancer conjur-follower-1 conjur-follower-2
+
+  [ "$(_follower_backends_used)" = 2 ]
+}
+
+# Follower 2 is healthy on its own port but never marked up by the load balancer
+# -- a certificate it cannot verify against its CA does exactly this.
+@test "a follower the load balancer never chooses is not a backend used" {
+  BIN_ENV_SOURCE_ONLY=1 source bin/env
+  SPEC_FOLLOWERS=2
+  stub_follower_load_balancer conjur-follower-1
+
+  [ "$(_follower_backends_used)" = 1 ]
+}
+
+# The counts are cumulative, so a server chosen before verification ran -- by the
+# provisioning's own reads -- must not count unless it is chosen again now.
+@test "only requests made while verifying count toward the backends used" {
+  BIN_ENV_SOURCE_ONLY=1 source bin/env
+  SPEC_FOLLOWERS=2
+  stub_follower_load_balancer conjur-follower-1
+  echo 40 > "$BATS_TEST_TMPDIR/lbtot-conjur-follower-2"
+
+  [ "$(_follower_backends_used)" = 1 ]
+}
+
+@test "a follower load balancer whose stats page does not answer is unreachable" {
+  BIN_ENV_SOURCE_ONLY=1 source bin/env
+  SPEC_FOLLOWERS=2
+  curl() {
+    return 7
+  }
+
+  [ "$(_follower_backends_used)" = 'unreachable' ]
 }
 
 #

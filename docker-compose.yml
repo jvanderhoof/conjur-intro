@@ -166,6 +166,56 @@ services:
       - ./system/logs/follower:/var/log/conjur:Z
       - ./files:/conjur_files
 
+  # Followers 2 and 3 are started only when asked for (bin/dap --follower-count).
+  # Unlike follower 1 they do not mount follower-certs: that volume is follower
+  # 1's certificate directory, shared with the load balancer so it can serve the
+  # follower certificate, and a second follower mounting it would configure over
+  # the first one's certificates. Their host ports are 450 + N, stepping over 451,
+  # CONJUR_K8S_FOLLOWER_PORT's default -- bin/utils.sh's _follower_port.
+  conjur-follower-2.mycompany.local:
+    image: registry.tld/conjur-appliance:${VERSION:-5.0-stable}
+    networks:
+      dap_net:
+        ipv4_address: 12.16.23.18
+    ports:
+      - "452:443"
+    expose:
+      - "443"
+      - "444"
+    environment:
+      CONJUR_AUTHENTICATORS: "${CONJUR_AUTHENTICATORS:-}"
+    security_opt:
+      - "seccomp:unconfined"
+    volumes:
+      - seeds:/opt/cyberark/dap/seeds
+      - mke:/secrets
+      - ./system/backup:/opt/conjur/backup:Z
+      - ./system/configuration:/opt/cyberark/dap/configuration:Z
+      - ./system/logs/follower-2:/var/log/conjur:Z
+      - ./files:/conjur_files
+
+  conjur-follower-3.mycompany.local:
+    image: registry.tld/conjur-appliance:${VERSION:-5.0-stable}
+    networks:
+      dap_net:
+        ipv4_address: 12.16.23.19
+    ports:
+      - "453:443"
+    expose:
+      - "443"
+      - "444"
+    environment:
+      CONJUR_AUTHENTICATORS: "${CONJUR_AUTHENTICATORS:-}"
+    security_opt:
+      - "seccomp:unconfined"
+    volumes:
+      - seeds:/opt/cyberark/dap/seeds
+      - mke:/secrets
+      - ./system/backup:/opt/conjur/backup:Z
+      - ./system/configuration:/opt/cyberark/dap/configuration:Z
+      - ./system/logs/follower-3:/var/log/conjur:Z
+      - ./files:/conjur_files
+
   client:
     image: cyberark/conjur-cli:9
     networks:

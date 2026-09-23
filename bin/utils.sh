@@ -29,8 +29,29 @@ function _wait_for_master {
   _wait_for_healthy 'DAP Master' "https://localhost:${CONJUR_MASTER_PORT}" "${1:-600}"
 }
 
+# Waits on one follower, by number, on its own published port rather than
+# through the follower load balancer, which answers as soon as any one is up.
 function _wait_for_follower {
-  _wait_for_healthy 'DAP Follower' "https://localhost:${CONJUR_FOLLOWER_PORT}" "${1:-600}"
+  local number="${1:-1}"
+
+  _wait_for_healthy "DAP Follower $number" "https://localhost:$(_follower_port "$number")" "${2:-600}"
+}
+
+# The most followers docker-compose.yml defines, conjur-follower-1 through -3.
+# Raising it takes a compose service per follower, that follower's host in
+# artifacts/certificate-generator/configuration/dap-follower.json, and the
+# schema's maximum for `followers`.
+FOLLOWER_CEILING=3
+
+# The host port docker-compose.yml publishes follower N's 443 on. Follower 1's
+# is configurable, as it always was; the others are fixed at 450 + N, which
+# steps over 451, CONJUR_K8S_FOLLOWER_PORT's default.
+function _follower_port {
+  if [[ "$1" = 1 ]]; then
+    echo "${CONJUR_FOLLOWER_PORT:-450}"
+  else
+    echo "$((450 + $1))"
+  fi
 }
 
 function _wait_for_healthy {
@@ -117,7 +138,8 @@ defaults
   timeout server  50000ms
 
 #
-# Peform SSL Pass-Through to proxy HTTPS requests to DAP
+# Terminates TLS with the follower's certificate, which names the load balancer,
+# and proxies HTTP to the followers
 #
 
 frontend www
@@ -126,8 +148,8 @@ frontend www
   default_backend www-backend
 
 #
-# Performs Layer 4 proxy
-# Uses DAP's HTTP health endpoint to determine master
+# Balances across every follower that DAP's HTTP health endpoint reports
+# healthy, re-encrypting to each against the leader's CA
 #
 
 backend www-backend
@@ -147,17 +169,26 @@ EOF
 }
 
 function _follower_backend_www_lines {
-  declare -a follower_servers
-
-  # docker-compose.yml defines a single follower, conjur-follower-1
-  local follower_count=1
-
   # Followers are resolved through docker's DNS at runtime (init-addr none), so
   # the load balancer can start before they are resolvable
-  for ((i=1; i<=follower_count; i++))
+  _numbered_lines 1 "${FOLLOWER_COUNT:-1}" \
+    '  server conjur-follower-{n} conjur-follower-{n}.mycompany.local:443 check port 443 check-ssl ssl ca-file /etc/ssl/certs/ca.pem resolvers docker init-addr none'
+}
+
+# One copy of the template per number from first to last, with {n} replaced by
+# the number, joined by newlines and with no trailing one, so it can be
+# substituted into a heredoc as a block. Nothing at all when last < first.
+function _numbered_lines {
+  local first="$1"
+  local last="$2"
+  local template="$3"
+  local lines=()
+  local i
+
+  for ((i=first; i<=last; i++))
   do
-    follower_servers+=("  server conjur-follower-$i conjur-follower-$i.mycompany.local:443 check port 443 check port 443 check-ssl ca-file /etc/ssl/certs/ca.pem ssl ca-file /etc/ssl/certs/ca.pem resolvers docker init-addr none")
+    lines+=("${template//\{n\}/$i}")
   done
 
-  printf '%s' "$(IFS=$'\n' ; echo "${follower_servers[*]}")"
+  printf '%s' "$(IFS=$'\n' ; echo "${lines[*]}")"
 }

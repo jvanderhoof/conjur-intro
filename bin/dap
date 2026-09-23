@@ -47,8 +47,12 @@ Usage: bin/dap [options]:
     --promote-standby                                         Stops the current master and promotes a standby
                                                                 (Requires configured standbys and no auto-failover).
 
-    --provision-follower                                      Configures follower behind a Layer 7 load balancer
+    --provision-follower                                      Configures followers behind a Layer 7 load balancer
                                                                 (Requires configured master).
+
+    --follower-count <count>                                  Number of Followers to deploy with --provision-follower,
+                                                                and to trust the load balancer on with
+                                                                --trust-follower-proxy (defaults to 1, at most 3).
 
     --provision-k8s-follower                                  Configures follower inside kubernetes cluster ran by kind
                                                                 (Requires configured master).
@@ -85,8 +89,8 @@ Usage: bin/dap [options]:
     --trigger-failover                                        Stops current master (Requires an auto-failover
                                                                 cluster).
 
-    --trust-follower-proxy                                    Adds Follower load balancer as a trusted proxy
-                                                                (Requires a configured follower).
+    --trust-follower-proxy                                    Adds Follower load balancer as a trusted proxy on each
+                                                                follower (Requires configured followers).
 
     --upgrade-master <version>                                Restores master from backup (Requires configured
                                                                 master).
@@ -195,39 +199,21 @@ EOF
 }
 
 _standby_backend_www_lines() {
-  declare -a standby_servers
-
   # The identifier for the Leader is 1, so we start at 2 for Standbys
-  for ((i=2; i<=STANDBY_COUNT+1; i++))
-  do
-    standby_servers+=("  server conjur-master-$i conjur-master-$i.mycompany.local:443 check port 443 check-ssl ca-file /etc/ssl/certs/ca.pem")
-  done
-
-  printf '%s' "$(IFS=$'\n' ; echo "${standby_servers[*]}")"
+  _numbered_lines 2 $((STANDBY_COUNT+1)) \
+    '  server conjur-master-{n} conjur-master-{n}.mycompany.local:443 check port 443 check-ssl ca-file /etc/ssl/certs/ca.pem'
 }
 
 _standby_backend_postgres_lines() {
-  declare -a standby_servers
-
   # The identifier for the Leader is 1, so we start at 2 for Standbys
-  for ((i=2; i<=STANDBY_COUNT+1; i++))
-  do
-    standby_servers+=("  server conjur-master-$i conjur-master-$i.mycompany.local:5432 check port 443 check-ssl ca-file /etc/ssl/certs/ca.pem")
-  done
-
-  printf '%s' "$(IFS=$'\n' ; echo "${standby_servers[*]}")"
+  _numbered_lines 2 $((STANDBY_COUNT+1)) \
+    '  server conjur-master-{n} conjur-master-{n}.mycompany.local:5432 check port 443 check-ssl ca-file /etc/ssl/certs/ca.pem'
 }
 
 _standby_backend_syslog_lines() {
-    declare -a standby_servers
-
   # The identifier for the Leader is 1, so we start at 2 for Standbys
-  for ((i=2; i<=STANDBY_COUNT+1; i++))
-  do
-    standby_servers+=("  server conjur-master-$i conjur-master-$i.mycompany.local:1999 check port 443 check-ssl ca-file /etc/ssl/certs/ca.pem")
-  done
-
-  printf '%s' "$(IFS=$'\n' ; echo "${standby_servers[*]}")"
+  _numbered_lines 2 $((STANDBY_COUNT+1)) \
+    '  server conjur-master-{n} conjur-master-{n}.mycompany.local:1999 check port 443 check-ssl ca-file /etc/ssl/certs/ca.pem'
 }
 
 function _set_master_single_node_proxy_config {
@@ -330,10 +316,20 @@ function _start_standby_synchronization {
     "evoke replication sync start"
 }
 
+# Followers 1 to FOLLOWER_COUNT, all configured from the one seed: a follower
+# seed carries the leader's data key and the follower certificate, and nothing
+# that ties it to a single follower -- each creates its own replication
+# subscription when it is configured -- so the master key dance below happens once
+# however many there are. Only the followers asked for are started; the rest of
+# docker-compose.yml's follower services stay down.
 function _setup_follower {
+  local i
 
-  docker compose rm --stop --force conjur-follower-1.mycompany.local
-  docker compose up --no-deps --detach conjur-follower-1.mycompany.local
+  for ((i=1; i<=FOLLOWER_COUNT; i++))
+  do
+    docker compose rm --stop --force "conjur-follower-$i.mycompany.local"
+    docker compose up --no-deps --detach "conjur-follower-$i.mycompany.local"
+  done
 
   if _mke_enabled; then
     # Need to decrypt the keys before seeding because certificate issue requires them to be decrypted
@@ -341,9 +337,14 @@ function _setup_follower {
       "cat /secrets/master.key | evoke keys decrypt-all -"
   fi
 
-  # Generate Seed file
+  # Generate the seed, written once per follower: `evoke unpack seed` removes the
+  # file it unpacks, so followers cannot share one. pipefail so that a seed that
+  # failed is not hidden behind tee succeeding.
+  local seed_files
+  seed_files="$(printf '/opt/cyberark/dap/seeds/follower-seed-%s.tar ' $(seq 1 "$FOLLOWER_COUNT"))"
+
   _run conjur-master-1.mycompany.local \
-    "evoke seed follower conjur-follower.mycompany.local > /opt/cyberark/dap/seeds/follower-seed.tar"
+    "set -o pipefail; evoke seed follower conjur-follower.mycompany.local | tee ${seed_files% } > /dev/null"
 
   if _mke_enabled; then 
     # Re-encrypt master after seeding our follower
@@ -364,19 +365,25 @@ function _setup_follower {
     _wait_for_master
   fi
 
-  # Unpack and Configure
-  _run conjur-follower-1.mycompany.local \
-    "evoke unpack seed /opt/cyberark/dap/seeds/follower-seed.tar && evoke configure follower"
+  for ((i=1; i<=FOLLOWER_COUNT; i++))
+  do
+    # Unpack and Configure
+    _run "conjur-follower-$i.mycompany.local" \
+      "evoke unpack seed /opt/cyberark/dap/seeds/follower-seed-$i.tar && evoke configure follower"
 
-  if _mke_enabled; then 
-    _run conjur-follower-1.mycompany.local \
-      "cat /secrets/master.key | evoke keys encrypt -"
+    if _mke_enabled; then
+      _run "conjur-follower-$i.mycompany.local" \
+        "cat /secrets/master.key | evoke keys encrypt -"
 
-    _run conjur-follower-1.mycompany.local \
-      "cat /secrets/master.key | evoke keys unlock -"
-  fi
+      _run "conjur-follower-$i.mycompany.local" \
+        "cat /secrets/master.key | evoke keys unlock -"
+    fi
+  done
 
-  # Copy certs for HAProxy. Use the conjur.pem/conjur.key symlinks (resolve
+  # Copy certs for HAProxy, from follower 1 alone: it is the only follower that
+  # shares the follower-certs volume with the load balancer. The others keep
+  # their certificates in their own containers, so that no two followers write
+  # the same files. Use the conjur.pem/conjur.key symlinks (resolve
   # to the client-facing/external cert under cert-separated appliance
   # builds, or the flat cert on pre-cert-separation builds) rather than the
   # hardcoded hostname-named files, which no longer exist once cert
@@ -389,7 +396,11 @@ function _setup_follower {
     "chown 99:99 /opt/conjur/etc/ssl/conjur-follower.mycompany.local.pem /opt/conjur/etc/ssl/conjur-follower.mycompany.local.pem.key"
 
   _start_l7_load_balancer
-  echo "DAP Follower instance available at: 'https://localhost:${CONJUR_FOLLOWER_PORT}'"
+  echo "DAP Follower load balancer available at: 'https://localhost:449'"
+  for ((i=1; i<=FOLLOWER_COUNT; i++))
+  do
+    echo "DAP Follower $i instance available at: 'https://localhost:$(_follower_port "$i")'"
+  done
 }
 
 function _setup_k8s_follower {
@@ -1009,15 +1020,8 @@ EOF
 }
 
 _standby_host_lines() {
-    declare -a standby_servers
-
   # The identifier for the Leader is 1, so we start at 2 for Standbys
-  for ((i=2; i<=STANDBY_COUNT+1; i++))
-  do
-    standby_servers+=("      - !host conjur-master-$i.mycompany.local")
-  done
-
-  printf '%s' "$(IFS=$'\n' ; echo "${standby_servers[*]}")"
+  _numbered_lines 2 $((STANDBY_COUNT+1)) '      - !host conjur-master-{n}.mycompany.local'
 }
 
 function _stop_replication {
@@ -1102,14 +1106,23 @@ function _add_follower_proxy {
   # forwards to the follower, leaving audit records and IP-restricted host identities
   # seeing the load balancer's address instead of the client's. Both addresses are
   # docker-compose.yml's.
-  _run conjur-follower-1.mycompany.local \
-    "evoke proxy add 12.16.23.16"
+  local i
+
+  for ((i=1; i<=FOLLOWER_COUNT; i++))
+  do
+    _run "conjur-follower-$i.mycompany.local" \
+      "evoke proxy add 12.16.23.16"
+  done
 
   # evoke proxy add returns before the follower's services restart to pick the
   # proxy up, so without this whatever runs next -- bin/env's verification, say --
-  # meets a follower that is briefly down and a load balancer answering 503.
+  # meets a follower that is briefly down and a load balancer answering 503, or
+  # routing to fewer followers than there are.
   if [[ $DRY_RUN = false ]]; then
-    _wait_for_follower
+    for ((i=1; i<=FOLLOWER_COUNT; i++))
+    do
+      _wait_for_follower "$i"
+    done
   fi
 }
 
@@ -1203,11 +1216,14 @@ function _rotate_certificates {
   # Re-enable auto-failover for the Master cluster
   _resume_autofailover
 
-  if [[ $(docker ps --quiet --filter "name=conjur-follower-1.mycompany.local") ]]; then
-    # Import the new certificate into each Follower
-    _run conjur-follower-1.mycompany.local \
-      "evoke ca import --force --key $cert_path/dap_follower/dap-follower-key.pem --set $cert_path/dap_follower/dap-follower.pem"
-  fi
+  # Import the new certificate into each Follower that is running
+  for ((i=1; i<=FOLLOWER_CEILING; i++))
+  do
+    if [[ $(docker ps --quiet --filter "name=conjur-follower-$i.mycompany.local") ]]; then
+      _run "conjur-follower-$i.mycompany.local" \
+        "evoke ca import --force --key $cert_path/dap_follower/dap-follower-key.pem --set $cert_path/dap_follower/dap-follower.pem"
+    fi
+  done
 }
 
 function _pause_autofailover {
@@ -1364,12 +1380,14 @@ PULL_IMAGES=false
 CMD=""
 export DHPATH="${DHPATH:-/etc/ssl}"
 STANDBY_COUNT=2
+FOLLOWER_COUNT=1
 
 while true ; do
   case "$1" in
     --create-backup ) CMD='_create_backup' ; shift ;;
     --dry-run ) DRY_RUN=true ; shift ;;
     --enable-auto-failover ) CMD='_enable_autofailover' ; shift ;;
+    --follower-count ) shift; FOLLOWER_COUNT=$1 ; shift ;;
     --generate-dh ) export DHPATH=/tmp ; shift ;;
     -h | --help ) _print_help ; shift ;;
     --import-custom-certificates ) CMD='_import_certificates' ; shift ;;
