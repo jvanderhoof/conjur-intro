@@ -31,6 +31,21 @@
           "description": "Enrol the leader and its standbys in an auto-failover cluster named `production`. Requires at least 2 standbys, which the cross-field rule below enforces.",
           "type": "boolean",
           "default": false
+        },
+        "master_key_encryption": {
+          "description": "Encrypt the leader's server keys with a master key (MKE), as `bin/dap --enable-mke` does. Done after the leader is configured and before any other node is seeded from it, because each seed has to carry the encrypted keys; standbys and followers are then configured with the same master key.",
+          "type": "boolean",
+          "default": false
+        },
+        "custom_certificates": {
+          "description": "Replace the leader's self-signed certificates with third-party ones issued by the CA that `bin/generate-certs` creates, as `bin/dap --import-custom-certificates` does. Done before master key encryption, so the imported keys are encrypted along with the rest, and before any other node is seeded, so every seed carries them. The generated leader certificate names conjur-master-1 through conjur-master-3 only, which the cross-field rule below enforces.",
+          "type": "boolean",
+          "default": false
+        },
+        "generate_dh": {
+          "description": "Have the leader generate its own Diffie-Hellman parameters rather than using the pre-generated ones in files/dhparam.pem, as `bin/dap --generate-dh` does. The appliance generates them in the background after it is configured, so provisioning waits for that to finish before seeding any other node from it.",
+          "type": "boolean",
+          "default": false
         }
       }
     },
@@ -74,6 +89,32 @@
           "leader": {
             "properties": {
               "standbys": { "minimum": 2 }
+            }
+          }
+        }
+      }
+    },
+    {
+      "title": "custom certificates name at most 2 standbys",
+      "description": "The custom leader certificate bin/generate-certs issues is defined by artifacts/certificate-generator/configuration/dap-master.json, whose hosts are conjur-master.mycompany.local and conjur-master-1 through conjur-master-3 -- the leader and 2 standbys. A third or fourth standby would serve a certificate that does not name it, which nothing connecting to it by name can verify. Widening this means adding hosts to that file, not changing bin/env.",
+      "if": {
+        "type": "object",
+        "required": ["leader"],
+        "properties": {
+          "leader": {
+            "type": "object",
+            "required": ["custom_certificates"],
+            "properties": {
+              "custom_certificates": { "const": true }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "leader": {
+            "properties": {
+              "standbys": { "maximum": 2 }
             }
           }
         }

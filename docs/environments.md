@@ -45,11 +45,14 @@ bin/env --plan environments/examples/single-node.yml
 Plan for environments/examples/single-node.yml
 
 Resolved spec:
-  version              5.0-stable
-  leader.standbys      0
-  leader.auto_failover false
-  followers            0
-  sample_data          true
+  version                      5.0-stable
+  leader.standbys              0
+  leader.auto_failover         false
+  leader.master_key_encryption false
+  leader.custom_certificates   false
+  leader.generate_dh           false
+  followers                    0
+  sample_data                  true
 
 Preflight:
   1. no environment already exists in this working copy
@@ -65,10 +68,13 @@ Checks:
   1. leader /health reports ok
   2. leader /info reports its configuration
   3. leader image tag is 5.0-stable
-  4. standbys running is 0
-  5. followers running is 0
-  6. auto-failover configured is false
-  7. sample secret staging/my-app-1/postgres-database/password is retrievable
+  4. leader server keys are not encrypted with a master key
+  5. leader presents a certificate issued by its own appliance CA
+  6. leader DH parameters are the pre-generated files/dhparam.pem
+  7. standbys running is 0
+  8. followers running is 0
+  9. auto-failover configured is false
+  10. sample secret staging/my-app-1/postgres-database/password is retrievable
 
 Nothing was provisioned (--plan).
 ```
@@ -118,6 +124,9 @@ fails loudly instead.
 | `version` | string, **required** | — | An appliance image tag, as passed to `bin/dap --version`. Letters, digits, dots, dashes, underscores. |
 | `leader.standbys` | integer | `0` | `0`–`4` — [see below](#standbys-and-auto-failover) |
 | `leader.auto_failover` | boolean | `false` | `true` needs at least 2 standbys — [see below](#standbys-and-auto-failover) |
+| `leader.master_key_encryption` | boolean | `false` | Encrypts the leader's server keys with a master key — [see below](#leader-hardening) |
+| `leader.custom_certificates` | boolean | `false` | Replaces the leader's self-signed certificates with ones from `bin/generate-certs`; `true` allows at most 2 standbys — [see below](#leader-hardening) |
+| `leader.generate_dh` | boolean | `false` | Has the leader generate its own DH parameters; does not work on 5.0-stable — [see below](#leader-hardening) |
 | `followers` | integer | `0` | `0`–`1` — [see below](#followers) |
 | `sample_data` | boolean | `true` | Loads the sample policy and variable values via `bin/api --load-sample-policy-and-values`. |
 | `events` | array | — | `[]` only. Reserved seam for transitions (upgrades, promotions, failovers); **not implemented**. |
@@ -259,6 +268,88 @@ is quietly out of date.
 
 Expect 5–10 minutes for the follower on top of the leader's own time.
 
+## Leader hardening
+
+Three independent booleans under `leader`, each off by default, in any
+combination. A production-shaped cluster with two of them on is
+[`environments/examples/hardened.yml`](../environments/examples/hardened.yml):
+
+```yaml
+version: "5.0-stable"
+
+leader:
+  standbys: 2
+  auto_failover: true
+  master_key_encryption: true
+  custom_certificates: true
+  generate_dh: false
+
+followers: 1
+```
+
+**All three are applied to the leader before anything is seeded from it.** A seed
+carries the leader's keys, certificates and DH parameters to the node it seeds, so
+a standby or follower seeded first would keep the leader's old ones. Certificates go
+in before encryption, so the keys they import are encrypted along with the rest:
+
+```
+Commands:
+  1. bin/dap --version 5.0-stable --standby-count 2 --provision-master
+  2. bin/dap --wait-for-master
+  3. bin/dap --import-custom-certificates
+  4. bin/dap --enable-mke
+  5. bin/dap --wait-for-master
+  6. bin/dap --version 5.0-stable --standby-count 2 --provision-standbys
+  7. bin/dap --standby-count 2 --enable-auto-failover
+  8. bin/dap --version 5.0-stable --provision-follower
+  9. bin/dap --trust-follower-proxy
+  10. bin/api --load-sample-policy-and-values
+```
+
+`--enable-mke` restarts the leader's services, hence the second wait. Once it is
+on, `bin/dap` configures every standby and follower with the same master key.
+
+**`master_key_encryption`** — encrypts the leader's server keys under
+`/opt/conjur/etc` with a master key held in `system/configuration/master-key`
+(gitignored), and unlocks them.
+
+**`custom_certificates`** — runs `bin/generate-certs` to create a root and
+intermediate CA and certificates signed by them, and imports them into the leader
+with `evoke ca import`. The generated files land under
+`system/configuration/certificates`, which is gitignored. The leader certificate
+names `conjur-master.mycompany.local` and `conjur-master-1` through
+`conjur-master-3` only, so more than 2 standbys is refused:
+
+```
+bin/env: spec error at /leader/standbys: 3 is greater than the maximum of 2
+bin/env:   hint: the custom leader certificate bin/generate-certs issues names conjur-master-1 through conjur-master-3 only (artifacts/certificate-generator/configuration/dap-master.json), so a third standby would serve a certificate that does not name it. Either ask for at most 2 standbys or set leader.custom_certificates: false
+bin/env: the spec was not accepted, so nothing was provisioned.
+```
+
+**`generate_dh`** — configures the leader without the repo's pre-generated
+`files/dhparam.pem`, so the appliance generates its own in the background, and
+waits for that before seeding anything:
+
+```
+Commands:
+  1. bin/dap --version 5.0-stable --generate-dh --provision-master
+  2. bin/dap --wait-for-master
+  3. bin/dap --wait-for-dh-params
+  4. bin/api --load-sample-policy-and-values
+```
+
+**On 5.0-stable this fails, and that is the appliance's bug.** Its generator,
+`/etc/my_init.d/dhgen.sh`, runs `openssl dhparam 3072 -out …`, which the image's
+OpenSSL 3 refuses, so the leader keeps its bootstrap parameters for good.
+`--wait-for-dh-params` notices the generator has exited and stops at once with its
+log — see [Troubleshooting](#troubleshooting). It is off in `hardened.yml` for that
+reason; set it to reproduce the failure, or against an appliance whose generator
+works.
+
+Each option gets its own verification row whichever way it is set, so a spec that
+leaves one off also confirms it is off — see
+[Reading the verification table](#reading-the-verification-table).
+
 ## The schema is the contract
 
 Every spec is validated against
@@ -390,6 +481,9 @@ Verification
   leader health          ok               ok               ok
   leader /info           reported         reported         ok
   leader image tag       5.0-stable       5.0-stable       ok
+  master key encryption  not encrypted    not encrypted    ok
+  leader certificate     appliance CA     appliance CA     ok
+  dh parameters          pre-generated    pre-generated    ok
   standbys running       0                0                ok
   followers running      0                0                ok
   auto-failover          false            false            ok
@@ -409,6 +503,9 @@ Verification
   leader health          ok               unreachable      MISMATCH
   leader /info           reported         no               MISMATCH
   leader image tag       5.0-stable       not running      MISMATCH
+  master key encryption  not encrypted    unreadable       MISMATCH
+  leader certificate     appliance CA     unreachable      MISMATCH
+  dh parameters          pre-generated    unreadable       MISMATCH
   standbys running       0                0                ok
   followers running      0                0                ok
   auto-failover          false            unreachable      MISMATCH
@@ -470,6 +567,27 @@ What the dimensions mean:
   requested tag rather than the appliance's self-reported build, so a symbolic
   tag like `5.0-stable` verifies as cleanly as a pinned one — and a stale
   container left behind by an earlier run shows up as a mismatch.
+- **master key encryption** — read off the leader's key files under
+  `/opt/conjur/etc`, not off the fact that `--enable-mke` returned. `encrypted`
+  means `*.key.enc` files are there; `not encrypted` means plain `*.key` files.
+  `locked` means the keys are encrypted but not unlocked — the `*.key` links point
+  at nothing, which is what an MKE leader looks like after a restart until
+  `evoke keys unlock` runs. `partly encrypted` is a mix, and `unreadable` means the
+  leader could not be asked.
+- **leader certificate** — the issuer of the certificate the leader actually
+  presents as `conjur-master.mycompany.local:443`, read with `openssl s_client`
+  from inside the leader container. `custom
+  CA` means it was issued by the intermediate `bin/generate-certs` created, with
+  that intermediate in the chain. `appliance CA` is the appliance's own
+  self-signed CA — what a certificate import that silently did not take leaves
+  behind. `no intermediate` means the right leaf served without its chain, which
+  a client holding only the root cannot verify. Any other issuer is reported by
+  its CN, and `unreachable` means nothing completed a handshake.
+- **dh parameters** — `/etc/ssl/dhparam.pem` on the leader, the file nginx serves
+  them from. `pre-generated` is the repo's `files/dhparam.pem`, `generated` is
+  anything else the leader produced, and `bootstrap` is the appliance's RFC 3526
+  placeholder — which is what a leader whose generator died still has. See
+  [Leader hardening](#leader-hardening).
 - **standbys running** / **followers running** — counted from the running
   containers, not assumed from the spec.
 - **standby N replication** — the leader's own view of that standby, read from
@@ -566,6 +684,10 @@ Also not supported, by design or by not-yet:
 - **Podman.** Refused on purpose — `bin/podman-dap` is a drifted fork, and a
   declarative layer over it would misrepresent what it can build. See
   [Preflight](#preflight).
+- **Custom certificates with more than 2 standbys.** The generated leader
+  certificate names three `conjur-master` nodes; adding hosts to
+  `artifacts/certificate-generator/configuration/dap-master.json` is what would
+  raise it.
 - **Authenticators, DR nodes, custom accounts, hostnames and passwords.** All
   outside the spec. See the non-goals in the design doc.
 
@@ -659,6 +781,36 @@ proxies`, and `docker compose exec conjur-follower-1.mycompany.local evoke proxy
 add 12.16.23.16` sets it. An environment provisioned before this was fixed has
 `12.16.23.15` — `conjur-master-5`, which never forwards to the follower — so the
 address needs replacing rather than adding to.
+
+**`bin/dap --wait-for-dh-params` stops with `The leader's DH parameter generator exited`**
+and `dhparam: Use -help for summary.` in the log it prints — the appliance's
+generator is broken on this version (see [Leader hardening](#leader-hardening)),
+and waiting longer will not help. Set `generate_dh: false`, or pick an appliance
+version whose `/etc/my_init.d/dhgen.sh` works.
+
+**The leader is unreachable through the load balancer after a custom certificate
+import**, with `SSL handshake failure` in `docker compose logs
+conjur-master.mycompany.local`. Once standbys exist, the leader load balancer
+health-checks each node against a copy of the leader's CA in
+`system/haproxy/certs`; a copy taken before the import still holds the appliance
+CA. `bin/dap --import-custom-certificates` refreshes it now, so this means an
+environment built before that fix, or certificates changed some other way.
+Refresh it by hand:
+
+```sh
+docker cp "$(docker compose ps -q conjur-master-1.mycompany.local)":/opt/conjur/etc/ssl/. system/haproxy/certs
+docker compose restart conjur-master.mycompany.local
+```
+
+**`leader certificate … appliance CA` with `custom_certificates: true`.** The
+import did not take. `docker compose exec conjur-master-1.mycompany.local evoke ca
+list` shows what the leader holds, and the exact read behind the row is:
+
+```sh
+docker compose exec conjur-master-1.mycompany.local openssl s_client \
+  -connect conjur-master.mycompany.local:443 -servername conjur-master.mycompany.local \
+  < /dev/null 2> /dev/null | head -8
+```
 
 **`cluster member N … missing`** — the node is not in etcd's member list even
 though the leader reports a cluster. `docker compose exec

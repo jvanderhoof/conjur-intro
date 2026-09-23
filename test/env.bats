@@ -14,7 +14,7 @@ setup_file() {
 
   # Build the validator up front so the first test is not timed with a docker
   # build in it.
-  docker build --quiet --tag conjur-intro/env-validator:2 artifacts/env-validator > /dev/null
+  docker build --quiet --tag conjur-intro/env-validator:3 artifacts/env-validator > /dev/null
 }
 
 setup() {
@@ -43,6 +43,21 @@ rows() {
 plan_checks() {
   printf '%s\n' "$output" | awk '/^Checks:$/{ found = 1; next } found && !NF { exit } found' \
     | sed 's/^  [0-9]*\. //'
+}
+
+# Stubs the three hardening probes with the answers a leader provisioned without
+# any of them gives, for verification tests about something else that need every
+# other row to pass.
+stub_unhardened_leader() {
+  _leader_key_encryption_state() {
+    echo 'not encrypted'
+  }
+  _leader_certificate_state() {
+    echo 'appliance CA'
+  }
+  _leader_dh_params_state() {
+    echo 'pre-generated'
+  }
 }
 
 # The preflight checks bin/env said it would run, one per line, stripped of
@@ -93,11 +108,11 @@ bin/api --load-sample-policy-and-values' ]
   run bin/env --plan "$SPEC"
 
   [ "$status" -eq 0 ]
-  [[ "$output" == *"version              13.5"* ]]
-  [[ "$output" == *"leader.standbys      0"* ]]
-  [[ "$output" == *"leader.auto_failover false"* ]]
-  [[ "$output" == *"followers            0"* ]]
-  [[ "$output" == *"sample_data          true"* ]]
+  [[ "$(rows)" == *"version 13.5"* ]]
+  [[ "$(rows)" == *"leader.standbys 0"* ]]
+  [[ "$(rows)" == *"leader.auto_failover false"* ]]
+  [[ "$(rows)" == *"followers 0"* ]]
+  [[ "$(rows)" == *"sample_data true"* ]]
 }
 
 @test "plan mode lists the verification checks, including secret retrieval" {
@@ -278,6 +293,152 @@ bin/api --load-sample-policy-and-values' ]
 
   [ "$status" -eq 0 ]
   [[ "$(plan_preflight)" == *'host ports 443, 444, 7000 are free'* ]]
+}
+
+#
+## Leader hardening -- master key encryption, custom certificates, DH parameters
+#
+# Three independent booleans that share one insertion point: each is done to the
+# leader around configure time, and before any other node is seeded from it,
+# because a seed carries the leader's keys, certificates and DH parameters to
+# whatever it seeds. Getting that ordering wrong is the whole risk, which is why
+# the plan is what these pin.
+
+@test "a spec with no hardening flags plans none of the hardening steps" {
+  spec 'version: "13.5"'
+
+  run bin/env --plan "$SPEC"
+
+  [ "$status" -eq 0 ]
+  [[ "$(rows)" == *"leader.master_key_encryption false"* ]]
+  [[ "$(rows)" == *"leader.custom_certificates false"* ]]
+  [[ "$(rows)" == *"leader.generate_dh false"* ]]
+  [[ "$(plan_commands)" != *'--enable-mke'* ]]
+  [[ "$(plan_commands)" != *'--import-custom-certificates'* ]]
+  [[ "$(plan_commands)" != *'--generate-dh'* ]]
+  [[ "$(plan_commands)" != *'--wait-for-dh-params'* ]]
+}
+
+@test "generated DH parameters are asked for at configure time, then waited for" {
+  spec 'version: "13.5"' 'leader:' '  generate_dh: true'
+
+  run bin/env --plan "$SPEC"
+
+  [ "$status" -eq 0 ]
+
+  # --generate-dh is not a step of its own: it changes what --provision-master does,
+  # by keeping the pre-generated parameters out of the place `evoke configure
+  # master` looks for them. The appliance then generates its own in the background,
+  # at idle priority, which is why there is a wait -- a leader checked the moment
+  # it is healthy is still serving the bootstrap group.
+  [ "$(plan_commands)" = 'bin/dap --version 13.5 --generate-dh --provision-master
+bin/dap --wait-for-master
+bin/dap --wait-for-dh-params
+bin/api --load-sample-policy-and-values' ]
+}
+
+@test "custom certificates are imported once the leader is configured and healthy" {
+  spec 'version: "13.5"' 'leader:' '  custom_certificates: true'
+
+  run bin/env --plan "$SPEC"
+
+  [ "$status" -eq 0 ]
+
+  # `evoke ca import` replaces a certificate the leader already has, so it needs a
+  # configured leader -- and it needs to precede the sample data only for the
+  # retrievability check to have been made over the certificate the spec asked for.
+  [ "$(plan_commands)" = 'bin/dap --version 13.5 --provision-master
+bin/dap --wait-for-master
+bin/dap --import-custom-certificates
+bin/api --load-sample-policy-and-values' ]
+}
+
+@test "master key encryption is enabled on the configured leader, and waited out" {
+  spec 'version: "13.5"' 'leader:' '  master_key_encryption: true'
+
+  run bin/env --plan "$SPEC"
+
+  [ "$status" -eq 0 ]
+
+  # Unlocking the encrypted keys restarts nginx, postgres and conjur, so the leader
+  # is waited for again before anything else talks to it.
+  [ "$(plan_commands)" = 'bin/dap --version 13.5 --provision-master
+bin/dap --wait-for-master
+bin/dap --enable-mke
+bin/dap --wait-for-master
+bin/api --load-sample-policy-and-values' ]
+}
+
+@test "all three hardening options are applied to the leader before any node is seeded" {
+  spec 'version: "13.5"' \
+    'leader:' \
+    '  standbys: 2' \
+    '  auto_failover: true' \
+    '  master_key_encryption: true' \
+    '  custom_certificates: true' \
+    '  generate_dh: true' \
+    'followers: 1'
+
+  run bin/env --plan "$SPEC"
+
+  [ "$status" -eq 0 ]
+
+  # Certificates before encryption, so the keys they import are encrypted along
+  # with the rest -- imported afterwards, they would sit on disk in plaintext
+  # beside keys that are not. Encryption before any seed, because bin/dap
+  # configures a standby or follower with the master key only when the leader
+  # already has one. And the DH wait before any seed too, so the standbys and the
+  # follower inherit the generated parameters rather than the bootstrap group.
+  [ "$(plan_commands)" = 'bin/dap --version 13.5 --standby-count 2 --generate-dh --provision-master
+bin/dap --wait-for-master
+bin/dap --import-custom-certificates
+bin/dap --enable-mke
+bin/dap --wait-for-master
+bin/dap --wait-for-dh-params
+bin/dap --version 13.5 --standby-count 2 --provision-standbys
+bin/dap --standby-count 2 --enable-auto-failover
+bin/dap --version 13.5 --provision-follower
+bin/dap --trust-follower-proxy
+bin/api --load-sample-policy-and-values' ]
+}
+
+@test "the tracked hardened example plans certificates and encryption before any seed" {
+  run bin/env --plan environments/examples/hardened.yml
+
+  [ "$status" -eq 0 ]
+  [ "$(plan_commands)" = 'bin/dap --version 5.0-stable --standby-count 2 --provision-master
+bin/dap --wait-for-master
+bin/dap --import-custom-certificates
+bin/dap --enable-mke
+bin/dap --wait-for-master
+bin/dap --version 5.0-stable --standby-count 2 --provision-standbys
+bin/dap --standby-count 2 --enable-auto-failover
+bin/dap --version 5.0-stable --provision-follower
+bin/dap --trust-follower-proxy
+bin/api --load-sample-policy-and-values' ]
+}
+
+# Checked whether or not they were asked for, like auto-failover: a leader that
+# is encrypted, or serving a custom chain, when the spec said it would not be is
+# as much a different environment as the reverse.
+@test "plan mode lists a hardening check for each option, whichever way it is set" {
+  spec 'version: "13.5"' 'leader:' '  custom_certificates: true'
+
+  run bin/env --plan "$SPEC"
+
+  [ "$status" -eq 0 ]
+  [[ "$(plan_checks)" == *'leader server keys are not encrypted with a master key'* ]]
+  [[ "$(plan_checks)" == *'leader presents a certificate issued by the custom CA'* ]]
+  [[ "$(plan_checks)" == *'leader DH parameters are the pre-generated files/dhparam.pem'* ]]
+
+  spec 'version: "13.5"' 'leader:' '  master_key_encryption: true' '  generate_dh: true'
+
+  run bin/env --plan "$SPEC"
+
+  [ "$status" -eq 0 ]
+  [[ "$(plan_checks)" == *'leader server keys are encrypted with a master key'* ]]
+  [[ "$(plan_checks)" == *'leader presents a certificate issued by its own appliance CA'* ]]
+  [[ "$(plan_checks)" == *'leader DH parameters were generated by the leader'* ]]
 }
 
 @test "disabling sample data drops both loading it and checking it" {
@@ -575,6 +736,44 @@ bin/api --load-sample-policy-and-values' ]
   run bin/env --plan "$SPEC"
 
   [ "$status" -eq 0 ]
+}
+
+@test "custom certificates with more standbys than the certificate names are refused" {
+  spec 'version: "13.5"' 'leader:' '  standbys: 3' '  custom_certificates: true'
+
+  run bin/env --plan "$SPEC"
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *'/leader/standbys'* ]]
+  [[ "$output" == *'maximum of 2'* ]]
+  [[ "$output" == *'dap-master.json'* ]]
+  [[ "$output" == *'nothing was provisioned'* ]]
+}
+
+@test "custom certificates with as many standbys as the certificate names validate" {
+  spec 'version: "13.5"' 'leader:' '  standbys: 2' '  custom_certificates: true'
+
+  run bin/env --plan "$SPEC"
+
+  [ "$status" -eq 0 ]
+}
+
+@test "the certificate rule does not fire when custom certificates are off" {
+  spec 'version: "13.5"' 'leader:' '  standbys: 4'
+
+  run bin/env --plan "$SPEC"
+
+  [ "$status" -eq 0 ]
+}
+
+@test "the hardening flags are booleans" {
+  spec 'version: "13.5"' 'leader:' '  master_key_encryption: yes please'
+
+  run bin/env --plan "$SPEC"
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *'/leader/master_key_encryption'* ]]
+  [[ "$output" == *"is not of type 'boolean'"* ]]
 }
 
 #
@@ -1084,6 +1283,12 @@ bin/api --load-sample-policy-and-values' ]
   [[ "$output" == *'ACTUAL'* ]]
   [[ "$output" == *'leader health'*'unreachable'*'MISMATCH'* ]]
   [[ "$output" == *'leader image tag'*'not running'*'MISMATCH'* ]]
+
+  # The spec asked for none of the hardening, so a probe that fell back to its
+  # "off" answer when there was no leader to ask would pass here.
+  [[ "$(rows)" == *'master key encryption not encrypted unreadable MISMATCH'* ]]
+  [[ "$(rows)" == *'leader certificate appliance CA unreachable MISMATCH'* ]]
+  [[ "$(rows)" == *'dh parameters pre-generated unreadable MISMATCH'* ]]
   [[ "$output" == *'does not match the spec'* ]]
 }
 
@@ -1218,6 +1423,7 @@ JSON
   _leader_image_tag() {
     echo 13.5
   }
+  stub_unhardened_leader
   _sample_data_state() {
     echo loaded
   }
@@ -1264,6 +1470,7 @@ JSON
   _leader_image_tag() {
     echo 13.5
   }
+  stub_unhardened_leader
   _sample_data_state() {
     echo loaded
   }
@@ -1307,6 +1514,7 @@ JSON
   _leader_image_tag() {
     echo 13.5
   }
+  stub_unhardened_leader
   _sample_data_state() {
     echo loaded
   }
@@ -1344,6 +1552,7 @@ JSON
   _leader_image_tag() {
     echo 13.5
   }
+  stub_unhardened_leader
 
   run _verify
 
@@ -1383,6 +1592,7 @@ JSON
   _leader_image_tag() {
     echo 13.5
   }
+  stub_unhardened_leader
 
   run _verify
 
@@ -1554,6 +1764,32 @@ conjur-master-3.mycompany.local' ]
   [[ "$output" != *'replication'* ]]
 }
 
+@test "each hardening option is verified against what the leader actually has" {
+  spec 'version: "13.5"' 'sample_data: false' 'leader:' '  master_key_encryption: true' '  generate_dh: true'
+
+  BIN_ENV_SOURCE_ONLY=1 source bin/env
+  _read_spec "$(_resolve_spec "$SPEC")"
+
+  _leader_key_encryption_state() {
+    echo encrypted
+  }
+  # Custom certificates the spec did not ask for, and a generator that never
+  # finished: both leaders are healthy, and neither is the one described.
+  _leader_certificate_state() {
+    echo 'custom CA'
+  }
+  _leader_dh_params_state() {
+    echo bootstrap
+  }
+
+  run _verify
+
+  [ "$status" -ne 0 ]
+  [[ "$(rows)" == *'master key encryption encrypted encrypted ok'* ]]
+  [[ "$(rows)" == *'leader certificate appliance CA custom CA MISMATCH'* ]]
+  [[ "$(rows)" == *'dh parameters generated bootstrap MISMATCH'* ]]
+}
+
 # The rest of the probes, each called for real against the seam it actually has:
 # curl for the two API reads, docker for the image tag, bin/api for the sample data.
 # Stubbing a probe checks what _verify does with an answer, never whether the probe
@@ -1707,6 +1943,283 @@ JSON
   }
 
   [ "$(_leader_image_tag)" = 'unknown' ]
+}
+
+# Read off the key files themselves rather than off `bin/dap --enable-mke` having
+# succeeded, because what the spec asks for is keys that are encrypted, not a
+# command that ran. Both listings are the live leader's: configured, and then
+# encrypted and unlocked. `evoke keys encrypt` replaces each key with a `.key.enc`
+# beside it, and unlocking puts back only a symlink into /dev/shm -- so symlinks
+# are present in both listings, and it is the regular files that tell them apart.
+@test "master key encryption is read off the leader's key files" {
+  BIN_ENV_SOURCE_ONLY=1 source bin/env
+
+  docker() {
+    case "$*" in
+      *'compose exec -T conjur-master-1.mycompany.local find /opt/conjur/etc'* )
+        cat <<'LISTING'
+ff /opt/conjur/etc/possum.key
+ff /opt/conjur/etc/ui.key
+lf /opt/conjur/etc/ssl/internal.key
+lf /opt/conjur/etc/ssl/conjur.key
+lf /opt/conjur/etc/ssl/ca.key
+lf /opt/conjur/etc/ssl/external.key
+ff /opt/conjur/etc/ssl/external/conjur-master.mycompany.local.key
+ff /opt/conjur/etc/ssl/external/ca.key
+ff /opt/conjur/etc/ssl/internal/conjur-master.mycompany.local.key
+ff /opt/conjur/etc/ssl/internal/ca.key
+LISTING
+        ;;
+      * ) return 1 ;;
+    esac
+  }
+
+  [ "$(_leader_key_encryption_state)" = 'not encrypted' ]
+
+  docker() {
+    case "$*" in
+      *'compose exec -T conjur-master-1.mycompany.local find /opt/conjur/etc'* )
+        cat <<'LISTING'
+ff /opt/conjur/etc/ui.key.enc
+ff /opt/conjur/etc/possum.key.enc
+ff /opt/conjur/etc/ssl/conjur-follower.mycompany.local.key.enc
+lf /opt/conjur/etc/ssl/conjur-follower.mycompany.local.key
+lf /opt/conjur/etc/ssl/internal.key
+lf /opt/conjur/etc/ssl/conjur.key
+lf /opt/conjur/etc/ssl/external.key
+lf /opt/conjur/etc/ssl/external/conjur-master.mycompany.local.key
+ff /opt/conjur/etc/ssl/external/conjur-master.mycompany.local.key.enc
+lf /opt/conjur/etc/ssl/internal/conjur-master.mycompany.local.key
+ff /opt/conjur/etc/ssl/internal/conjur-master.mycompany.local.key.enc
+lf /opt/conjur/etc/ssl/internal/ca.key
+ff /opt/conjur/etc/ssl/internal/ca.key.enc
+LISTING
+        ;;
+      * ) return 1 ;;
+    esac
+  }
+
+  [ "$(_leader_key_encryption_state)" = 'encrypted' ]
+
+  # A key imported after encryption: the rest are encrypted, this one sits on disk
+  # in plaintext. Enabling MKE before importing certificates is what this catches.
+  docker() {
+    case "$*" in
+      *'find /opt/conjur/etc'* )
+        printf '%s\n' \
+          'ff /opt/conjur/etc/possum.key.enc' \
+          'ff /opt/conjur/etc/ssl/external/conjur-master.mycompany.local.key.enc' \
+          'ff /opt/conjur/etc/ssl/conjur-follower.mycompany.local.key' ;;
+      * ) return 1 ;;
+    esac
+  }
+
+  [ "$(_leader_key_encryption_state)" = 'partly encrypted' ]
+
+  # Encrypted but never unlocked -- after a restart, say. The symlinks point into a
+  # /dev/shm that is empty again, which find reports as a dangling link (N), and
+  # nginx and conjur cannot read their keys.
+  docker() {
+    case "$*" in
+      *'find /opt/conjur/etc'* )
+        printf '%s\n' \
+          'ff /opt/conjur/etc/possum.key.enc' \
+          'ff /opt/conjur/etc/ssl/external/conjur-master.mycompany.local.key.enc' \
+          'lN /opt/conjur/etc/ssl/external/conjur-master.mycompany.local.key' ;;
+      * ) return 1 ;;
+    esac
+  }
+
+  [ "$(_leader_key_encryption_state)" = 'locked' ]
+
+  # No leader to ask. Not `not encrypted`, which a spec without MKE would pass on.
+  docker() {
+    return 1
+  }
+
+  [ "$(_leader_key_encryption_state)" = 'unreadable' ]
+}
+
+# The chain a client is actually handed, read by connecting through the leader
+# load balancer the way a client does, rather than off `evoke ca import` having
+# succeeded -- a spec asking for custom certificates on a leader that silently
+# kept its self-signed ones has to fail here. Both handshakes are the live
+# leader's, before and after `bin/dap --import-custom-certificates`, with the
+# certificate bodies left out.
+@test "the leader's certificate is read off the chain it presents" {
+  BIN_ENV_SOURCE_ONLY=1 source bin/env
+
+  docker() {
+    case "$*" in
+      *'compose exec -T conjur-master-1.mycompany.local openssl s_client -connect conjur-master.mycompany.local:443'* )
+        cat <<'HANDSHAKE'
+CONNECTED(00000003)
+---
+Certificate chain
+ 0 s:CN = conjur-master.mycompany.local
+   i:O = demo, OU = Conjur CA, CN = conjur-master.mycompany.local
+   a:PKEY: rsaEncryption, 2048 (bit); sigalg: RSA-SHA256
+   v:NotBefore: Sep 23 12:24:47 2026 GMT; NotAfter: Sep 20 12:24:47 2036 GMT
+ 1 s:O = demo, OU = Conjur CA, CN = conjur-master.mycompany.local
+   i:O = demo, OU = Conjur CA, CN = conjur-master.mycompany.local
+   a:PKEY: rsaEncryption, 2048 (bit); sigalg: RSA-SHA256
+   v:NotBefore: Sep 23 12:24:43 2026 GMT; NotAfter: Sep 20 12:24:43 2036 GMT
+---
+Server certificate
+subject=CN = conjur-master.mycompany.local
+issuer=O = demo, OU = Conjur CA, CN = conjur-master.mycompany.local
+---
+HANDSHAKE
+        ;;
+      * ) return 1 ;;
+    esac
+  }
+
+  [ "$(_leader_certificate_state)" = 'appliance CA' ]
+
+  docker() {
+    case "$*" in
+      *'compose exec -T conjur-master-1.mycompany.local openssl s_client -connect conjur-master.mycompany.local:443'* )
+        cat <<'HANDSHAKE'
+CONNECTED(00000003)
+---
+Certificate chain
+ 0 s:C = US, ST = Massachusetts, L = Newton, O = Dynamic Access Provider, OU = Master, CN = conjur-master.mycompany.local
+   i:C = US, ST = Massachusetts, L = Newton, O = Cyberark USA Engineering, OU = Conjur, CN = Cyberark Conjur
+   a:PKEY: rsaEncryption, 2048 (bit); sigalg: RSA-SHA256
+   v:NotBefore: Sep 23 12:22:00 2026 GMT; NotAfter: Sep 23 12:22:00 2027 GMT
+ 1 s:C = US, ST = Massachusetts, L = Newton, O = Cyberark USA Engineering, OU = Conjur, CN = Cyberark Conjur
+   i:C = US, ST = Massachusetts, L = Newton, O = Cyberark USA Engineering, OU = Conjur, CN = Cyberark Conjur Root CA
+   a:PKEY: rsaEncryption, 2048 (bit); sigalg: RSA-SHA256
+   v:NotBefore: Sep 23 12:22:00 2026 GMT; NotAfter: Sep 14 04:22:00 2031 GMT
+ 2 s:C = US, ST = Massachusetts, L = Newton, O = Cyberark USA Engineering, OU = Conjur, CN = Cyberark Conjur Root CA
+   i:C = US, ST = Massachusetts, L = Newton, O = Cyberark USA Engineering, OU = Conjur, CN = Cyberark Conjur Root CA
+   a:PKEY: rsaEncryption, 2048 (bit); sigalg: RSA-SHA256
+   v:NotBefore: Sep 23 12:22:00 2026 GMT; NotAfter: Sep 22 12:22:00 2031 GMT
+---
+Server certificate
+subject=C = US, ST = Massachusetts, L = Newton, O = Dynamic Access Provider, OU = Master, CN = conjur-master.mycompany.local
+issuer=C = US, ST = Massachusetts, L = Newton, O = Cyberark USA Engineering, OU = Conjur, CN = Cyberark Conjur
+---
+HANDSHAKE
+        ;;
+      * ) return 1 ;;
+    esac
+  }
+
+  [ "$(_leader_certificate_state)" = 'custom CA' ]
+
+  # The custom leader certificate served without the intermediate that issued it:
+  # a client trusting only the custom root cannot build a path to it.
+  docker() {
+    printf '%s\n' \
+      'Certificate chain' \
+      ' 0 s:C = US, ST = Massachusetts, L = Newton, O = Dynamic Access Provider, OU = Master, CN = conjur-master.mycompany.local' \
+      '   i:C = US, ST = Massachusetts, L = Newton, O = Cyberark USA Engineering, OU = Conjur, CN = Cyberark Conjur' \
+      '---'
+  }
+
+  [ "$(_leader_certificate_state)" = 'no intermediate' ]
+
+  # Issued by neither CA bin/dap knows about. Named, because the issuer is what
+  # the operator has to go and find.
+  docker() {
+    printf '%s\n' \
+      'Certificate chain' \
+      ' 0 s:CN = conjur-master.mycompany.local' \
+      '   i:O = Example Corp, CN = Example Issuing CA' \
+      '---'
+  }
+
+  [ "$(_leader_certificate_state)" = 'Example Issuing CA' ]
+
+  # Nothing answered the handshake, which is not the same as a self-signed answer.
+  docker() {
+    echo 'connect:errno=111'
+    return 1
+  }
+
+  [ "$(_leader_certificate_state)" = 'unreachable' ]
+}
+
+# The file nginx's ssl_dhparam names, read off the leader. There are three things
+# it can hold, and the one to catch is the middle one: the pre-generated
+# files/dhparam.pem bin/dap copies in, the RFC 3526 group `evoke configure
+# master` installs as a stand-in -- tagged, so dhgen.sh knows to replace it -- or
+# parameters the leader generated. A leader asked to generate its own that never
+# finished is healthy, and serving the bootstrap group.
+@test "the leader's DH parameters are read off the file nginx serves them from" {
+  BIN_ENV_SOURCE_ONLY=1 source bin/env
+
+  # What bin/dap copies in, byte for byte.
+  docker() {
+    case "$*" in
+      *'compose exec -T conjur-master-1.mycompany.local cat /etc/ssl/dhparam.pem'* ) cat files/dhparam.pem ;;
+      * ) return 1 ;;
+    esac
+  }
+
+  [ "$(_leader_dh_params_state)" = 'pre-generated' ]
+
+  # The live leader's, configured with --generate-dh, whose generator had exited.
+  docker() {
+    case "$*" in
+      *'compose exec -T conjur-master-1.mycompany.local cat /etc/ssl/dhparam.pem'* )
+        cat <<'PEM'
+Nothing-up-my-sleeve pi-based Diffie-Hellman 3072-bit parameters from RFC 3526.
+Used for fast bootstrap with reasonable security; custom DH parameters are
+generated once enough entropy has been accumulated and replace this.
+
+NOTE: do not remove the following tag line.
+BOOTSTRAP PARAMETERS
+
+-----BEGIN DH PARAMETERS-----
+MIIBiAKCAYEA///////////JD9qiIWjCNMTGYouA3BzRKQJOCIpnzHQCC76mOxOb
+IlFKCHmONATd75UZs806QxswKwpt8l8UN0/hNW1tUcJF5IW1dmJefsb0TELppjft
+awv/XLb0Brft7jhr+1qJn6WunyQRfEsf5kkoZlHs5Fs9wgB8uKFjvwWY2kg2HFXT
+mmkWP6j9JM9fg2VdI9yjrZYcYvNWIIVSu57VKQdwlpZtZww1Tkq8mATxdGwIyhgh
+fDKQXkYuNs474553LBgOhgObJ4Oi7Aeij7XFXfBvTFLJ3ivL9pVYFxg5lUl86pVq
+5RXSJhiY+gUQFXKOWoqqxC2tMxcNBFB6M6hVIavfHLpk7PuFBFjb7wqK6nFXXQYM
+fbOXD4Wm4eTHq/WujNsJM9cejJTgSiVhnc7j0iYa0u5r8S/6BtmKCGTYdgJzPshq
+ZFIfKxgXeyAMu+EXV3phXWx3CYjAutlG4gjiT6B05asxQ9tb/OD9EI5LgtEgqTrS
+yv//////////AgEC
+-----END DH PARAMETERS-----
+PEM
+        ;;
+      * ) return 1 ;;
+    esac
+  }
+
+  [ "$(_leader_dh_params_state)" = 'bootstrap' ]
+
+  # What `openssl dhparam` wrote out on the leader: untagged, and not ours.
+  docker() {
+    case "$*" in
+      *'compose exec -T conjur-master-1.mycompany.local cat /etc/ssl/dhparam.pem'* )
+        cat <<'PEM'
+-----BEGIN DH PARAMETERS-----
+MIIBCAKCAQEA//////////+t+FRYortKmq/cViAnPTzx2LnFg84tNpWp4TZBFGQz
++8yTnc4kmz75fS/jY2MMddj2gbICrsRhetPfHtXV/WVhJDP1H18GbtCFY2VVPe0a
+87VXE15/V8k1mE8McODmi3fipona8+/och3xWKE2rec1MKzKT0g6eXq8CrGCsyT7
+YdEIqUuyyOP7uWrat2DX9GgdT0Kj3jlN9K5W7edjcrsZCwenyO4KbXCeAvzhzffi
+7MA0BM0oNC9hkXL+nOmFg/+OTxIy7vKBg8P+OxtMb61zO7X8vC7CIAXFjvGDfRaD
+ssbzSibBsu/6iGtCOGEoXJf//////////wIBAg==
+-----END DH PARAMETERS-----
+PEM
+        ;;
+      * ) return 1 ;;
+    esac
+  }
+
+  [ "$(_leader_dh_params_state)" = 'generated' ]
+
+  # Neither a leader to ask nor a file to read. Not `generated`, which is what a
+  # probe that only looked for the bootstrap tag would say.
+  docker() {
+    return 1
+  }
+
+  [ "$(_leader_dh_params_state)" = 'unreadable' ]
 }
 
 # A follower answers /health on its own port, and the probe has to ask it there.

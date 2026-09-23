@@ -109,6 +109,20 @@ def hint_for(pointer, message):
             "leader.auto_failover: false"
         )
 
+    # The certificate rule fires the same way, as a bare range error on
+    # /leader/standbys, and is told apart from the compose ceiling by its number --
+    # so the 2 here has to stay in step with the `maximum` in the schema's
+    # certificate rule, and the compose ceiling below has to stay above it.
+    if pointer == "/leader/standbys" and "maximum of 2" in message:
+        return (
+            "the custom leader certificate bin/generate-certs issues names "
+            "conjur-master-1 through conjur-master-3 only "
+            "(artifacts/certificate-generator/configuration/dap-master.json), "
+            "so a third standby would serve a certificate that does not name it. "
+            "Either ask for at most 2 standbys or set "
+            "leader.custom_certificates: false"
+        )
+
     # Where the standby ceiling comes from. The number itself is the schema's;
     # what a bare range error cannot say is that it is the compose file, not
     # bin/env, that runs out of nodes -- and so what raising it would take.

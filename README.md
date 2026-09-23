@@ -120,6 +120,7 @@ To connect to the UI in the browser, use ports 10443(through HA proxy) or 10444(
 |--create-backup|action|• Creates a backup|Requires configured master|
 |--dry-run|configuration|Only print configuration commands|
 |--enable-auto-failover|action|• Configures Master cluster with auto-failover|Requires configured master and standbys|
+|--enable-mke|action|• Generates a master key<br>• Encrypts and unlocks the Master's server keys with it|Requires configured master, before any standby or follower|
 |--generate-dh|configuration|• Disables the mounting of pre-generated DH params inside the master so they're generated on the fly|
 |--help||Shows all available arguments||
 |--import-custom-certificates|action|• Imports pre-generated 3rd-party certificates|Requires configured master|
@@ -137,6 +138,7 @@ To connect to the UI in the browser, use ports 10443(through HA proxy) or 10444(
 |--trust-follower-proxy|action|• Adds Follower load balancer as a trusted proxy|Requires configured follower|
 |--upgrade-master `<version>`|action|• Removes auto-failover (if enabled)<br>• Generates a backup<br>• Stops and removes master<br>• Starts new DAP container<br>• Restores master from backup|Requires configured master|
 |--version `<version>`|configuration|Version of DAP to use (defaults to latest)|
+|--wait-for-dh-params|action|Blocks until the Master has replaced its bootstrap DH parameters with generated ones|Use after `--generate-dh --provision-master`|
 |--k8s-follower-version `<version>`|configuration|Version of K8S-Follower to use (defaults to latest)|
 |--follower-to-master-connection `<on/off>`|action|Pauses or unpauses follower connection to master|Requires a configured master|
 
@@ -211,6 +213,13 @@ secret retrieval —
 A second follower would need new compose services, so the schema refuses it rather
 than letting `bin/env` quietly build something smaller than you asked for.
 
+The leader can be hardened with three independent booleans — master key
+encryption, custom certificates and generated DH parameters — each applied before
+anything is seeded from it, and each verified off the leader itself: its key
+files, the certificate chain it presents, and the DH parameters nginx serves.
+[`environments/examples/hardened.yml`](environments/examples/hardened.yml) puts
+the first two together with standbys, auto-failover and a follower.
+
 Nothing is reconciled. A preflight checks up front that the appliance version
 resolves and the host ports are free, and an environment that already exists is
 refused rather than half-configured — rebuild it with `--recreate`, which states
@@ -265,6 +274,7 @@ Usage: bin/dap single [options]
     --create-backup                   Creates a backup|Requires configured master
     --dry-run                         Print configuration commands with executing
     --enable-auto-failover            Configures Master cluster with auto-failover (Requires configured master and standbys)
+    --enable-mke                      Encrypts the Master's server keys with a master key (Requires configured master, before any standby or follower)
     --h, --help                       Shows this help message
     --import-custom-certificates      Imports pre-generated 3rd-party certificates (Requires configured master)
     --promote-standby                 Stops the current master and promotes a standby (Requires configured standbys and no auto-failover)
@@ -283,6 +293,7 @@ Usage: bin/dap single [options]
     --upgrade-master <version>        Restores master from backup (Requires configured master)
     --version <version>               Version of DAP to use (defaults to latest build)
     --k8s-follower-version <version>  Version of K8S-Follower to use (defaults to latest build)
+    --wait-for-dh-params              Blocks until the Master has replaced its bootstrap DH parameters with generated ones
 ```
 
 ### `bin/cli`

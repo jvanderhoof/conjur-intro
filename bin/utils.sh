@@ -26,23 +26,32 @@ function dotenv {
 }
 
 function _wait_for_master {
-  local master_url="https://localhost:${CONJUR_MASTER_PORT}"
+  _wait_for_healthy 'DAP Master' "https://localhost:${CONJUR_MASTER_PORT}" "${1:-600}"
+}
 
-  echo "Waiting for DAP Master to be ready... ${master_url}"
+function _wait_for_follower {
+  _wait_for_healthy 'DAP Follower' "https://localhost:${CONJUR_FOLLOWER_PORT}" "${1:-600}"
+}
+
+function _wait_for_healthy {
+  local name="$1"
+  local url="$2"
+
+  echo "Waiting for ${name} to be ready... ${url}"
 
   # Wait for 10 successful connections in a row
   local COUNTER=0
 
-  TIMEOUT="${1:-600}"
+  TIMEOUT="${3:-600}"
   SECONDS=0
   while [ $COUNTER -lt 10 ]; do
     if [ $SECONDS -ge $TIMEOUT ]; then
-      echo "Timed out waiting for DAP Master to be ready"
+      echo "Timed out waiting for ${name} to be ready"
       exit 1
     fi
 
     local response
-    response=$(curl -k --silent --head "$master_url/health" || true)
+    response=$(curl -k --silent --head "$url/health" || true)
 
     if ! echo "$response" | grep -iq "Conjur-Health: OK"; then
       sleep 5

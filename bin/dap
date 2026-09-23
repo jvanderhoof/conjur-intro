@@ -28,6 +28,10 @@ Usage: bin/dap [options]:
 
     --dry-run                                                 Print configuration commands with executing.
 
+    --enable-mke                                              Encrypts the Master's server keys with a generated master
+                                                                key (Requires configured master, and no standbys or
+                                                                followers yet).
+
     --enable-auto-failover                                    Configures Master cluster with auto-failover
                                                                 (Requires configured master and standbys).
 
@@ -88,6 +92,9 @@ Usage: bin/dap [options]:
                                                                 master).
 
     --wait-for-master                                         Blocks until the Master is healthy.
+
+    --wait-for-dh-params                                      Blocks until the Master has replaced its bootstrap DH
+                                                                parameters with generated ones (use with --generate-dh).
 
     --version <version>                                       Version of DAP to use (defaults to latest build).
 
@@ -346,6 +353,14 @@ function _setup_follower {
 
     _run conjur-master-1.mycompany.local \
       "evoke wait" # Allow leaders services to become healthy before configuring follower
+
+    # And for the load balancer to route to them again. Unlocking restarts the
+    # leader's nginx, so HAProxy marks it down, and `evoke wait` is satisfied by the
+    # leader's own services before HAProxy has seen enough passing checks to mark
+    # it up -- the follower then configures against a load balancer with no
+    # postgres backend and fails with "Replication connection could not be
+    # established". _wait_for_master asks through the load balancer.
+    _wait_for_master
   fi
 
   # Unpack and Configure
@@ -806,11 +821,15 @@ function _perform_promotion {
     "evoke replication rebase conjur-master-2.mycompany.local"
 }
 
+function _snapshot_leader_certificates_for_proxy {
+  mkdir -p ./system/haproxy/certs
+  docker cp "$(docker compose ps -q conjur-master-1.mycompany.local)":/opt/conjur/etc/ssl/. ./system/haproxy/certs
+}
+
 function deploy_proxy {
   _set_master_single_node_proxy_config
   # Copy Conjur generated certificates to HAProxy
-  mkdir -p ./system/haproxy/certs
-  docker cp "$(docker compose ps -q conjur-master-1.mycompany.local)":/opt/conjur/etc/ssl/. ./system/haproxy/certs
+  _snapshot_leader_certificates_for_proxy
   docker compose up -d --no-deps conjur-master.mycompany.local
   _verify_proxy_network
 }
@@ -1046,8 +1065,7 @@ function _restore_from_backup {
   # restore). HAProxy validates backend certs against a snapshot copied at
   # provision time (see deploy_proxy) and won't see this change on its own,
   # so refresh the snapshot and reload haproxy to pick up the new CA/certs.
-  mkdir -p ./system/haproxy/certs
-  docker cp "$(docker compose ps -q conjur-master-1.mycompany.local)":/opt/conjur/etc/ssl/. ./system/haproxy/certs
+  _snapshot_leader_certificates_for_proxy
   _reload_container 'conjur-master.mycompany.local'
 }
 
@@ -1084,6 +1102,13 @@ function _add_follower_proxy {
   # docker-compose.yml's.
   _run conjur-follower-1.mycompany.local \
     "evoke proxy add 12.16.23.16"
+
+  # evoke proxy add returns before the follower's services restart to pick the
+  # proxy up, so without this whatever runs next -- bin/env's verification, say --
+  # meets a follower that is briefly down and a load balancer answering 503.
+  if [[ $DRY_RUN = false ]]; then
+    _wait_for_follower
+  fi
 }
 
 function _trigger_master_failover_failover {
@@ -1128,6 +1153,18 @@ function _import_certificates {
     "evoke ca import --force --key $cert_path/dap_master/dap-master-key.pem --set $cert_path/dap_master/dap-master.pem"
   _run conjur-master-1.mycompany.local \
     "evoke ca import --force --key $cert_path/dap_follower/dap-follower-key.pem $cert_path/dap_follower/dap-follower.pem"
+
+  # The leader now serves a chain from the imported CA, but HAProxy validates its
+  # backends against the snapshot deploy_proxy copied at provision time, which
+  # still holds the appliance's self-signed CA. The single-node config only checks
+  # the port, so nothing shows until --provision-standbys swaps in the multi-node
+  # config's check-ssl -- at which point every backend fails its check and the
+  # leader is unreachable through its load balancer. Refresh it the way
+  # _restore_from_backup does.
+  if [[ $DRY_RUN = false ]]; then
+    _snapshot_leader_certificates_for_proxy
+    _reload_container 'conjur-master.mycompany.local'
+  fi
 }
 
 function _rotate_certificates {
@@ -1226,6 +1263,68 @@ EOF
   _run conjur-master-1.mycompany.local "cat /secrets/master.key | evoke keys unlock -"
 }
 
+# Blocks until the leader has swapped its bootstrap DH parameters for ones it
+# generated itself. With --generate-dh, `evoke configure master` installs a fixed
+# RFC 3526 group tagged "BOOTSTRAP PARAMETERS" and starts /etc/my_init.d/dhgen.sh,
+# which generates new parameters in the background at idle priority -- so a
+# healthy leader is not yet one with generated parameters, and a standby or
+# follower seeded from it would carry the bootstrap group. A leader configured
+# with the pre-generated files/dhparam.pem has no tag and returns straight away.
+#
+# Fails as soon as the generator has exited without replacing the bootstrap
+# group, rather than waiting out the timeout: dhgen.sh runs
+# `openssl dhparam 3072 -out ...`, and OpenSSL 3 (5.0-stable ships 3.0.13) stops
+# parsing options at the first positional argument and refuses that order, so on
+# those images the generator dies within a second and never retries. A log that
+# says the generation finished is the moment between openssl exiting and the
+# new parameters being moved into place, so it still counts as in progress.
+function _wait_for_dh_params {
+  local timeout="${1:-1800}"
+  local target='/etc/ssl/dhparam.pem'
+  local state
+
+  if [[ $DRY_RUN = true ]]; then
+    return 0
+  fi
+
+  echo "Waiting for the leader to finish generating its DH parameters..."
+
+  SECONDS=0
+  while true; do
+    # stdin closed so this cannot drain the caller's. A leader that cannot be
+    # asked is an empty state rather than an exit under set -e, so it runs on to
+    # the timeout below and says so.
+    state="$(docker compose exec -T conjur-master-1.mycompany.local bash -c "
+      if [ ! -f $target ]; then echo missing
+      elif ! grep -q 'BOOTSTRAP PARAMETERS' $target; then echo generated
+      elif pgrep -x openssl > /dev/null; then echo generating
+      elif grep -q 'Finished generation' /var/log/dhgen.log 2> /dev/null; then echo generating
+      else echo stopped
+      fi" < /dev/null || true)"
+
+    case "$state" in
+      generated )
+        echo "DH parameters generated after ${SECONDS}s"
+        return 0
+        ;;
+      stopped )
+        echo "The leader's DH parameter generator exited without replacing the bootstrap parameters."
+        echo "Its log, /var/log/dhgen.log on the leader:"
+        docker compose exec -T conjur-master-1.mycompany.local cat /var/log/dhgen.log < /dev/null
+        exit 1
+        ;;
+    esac
+
+    if [ $SECONDS -ge "$timeout" ]; then
+      echo "Timed out after ${timeout}s waiting for DH parameter generation (last state: ${state:-unknown})."
+      echo "Progress is logged on the leader in /var/log/dhgen.log."
+      exit 1
+    fi
+
+    sleep 10
+  done
+}
+
 _standby_altnames() {
 
   declare -a standby_altnames
@@ -1280,6 +1379,7 @@ while true ; do
     --provision-secretless-broker ) CMD='_setup_secretless_broker' ; shift ;;
     --provision-master ) CMD='_single_master' ; shift ;;
     --enable-mke ) CMD="_enable_mke" ; shift ;;
+    --wait-for-dh-params ) CMD='_wait_for_dh_params' ; shift ;;
     --provision-standbys ) CMD='_setup_standbys' ; shift ;;
     --provision-keycloak ) CMD='_setup_keycloak' ; shift ;;
     --reenroll-failed-leader ) shift ; CMD="_reenroll_failed_leader $1 $2" ; shift ; shift ;;

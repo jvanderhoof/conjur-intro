@@ -43,7 +43,7 @@ FOLLOWER_URL='https://conjur-follower.mycompany.local'
 
 # Holds the YAML parser and the JSON Schema validator so that neither is a host
 # dependency. Bump the tag when artifacts/env-validator changes.
-VALIDATOR_IMAGE='conjur-intro/env-validator:2'
+VALIDATOR_IMAGE='conjur-intro/env-validator:3'
 SCHEMA='environments/schema.json'
 
 # The appliance image docker-compose.yml starts. Preflight resolves the
@@ -86,8 +86,10 @@ Usage: bin/env [options] <spec>
 The spec is a YAML file validated against $SCHEMA; an unknown or
 misspelled key, or a topology bin/env cannot build, is a hard error naming the
 offending field. Start from environments/examples/single-node.yml,
-environments/examples/highly-available.yml for a leader with standbys, or
-environments/examples/leader-and-follower.yml for a leader and a follower.
+environments/examples/highly-available.yml for a leader with standbys,
+environments/examples/leader-and-follower.yml for a leader and a follower, or
+environments/examples/hardened.yml for custom certificates and master key
+encryption across all three tiers.
 
 Nothing is reconciled. If an environment already exists in this working copy,
 bin/env refuses rather than half-configuring it; rebuild with --recreate, or
@@ -105,6 +107,14 @@ provisioned alongside them; asking for a follower also configures its proxy trus
 so there is no manual follow-up step. A second follower would need new compose
 services and generated proxy config, so the schema rejects it rather than letting
 bin/env quietly build something smaller.
+
+The leader can be hardened with master key encryption, custom certificates and
+generated DH parameters, each an independent boolean that defaults to off. All
+three are applied to the leader before anything is seeded from it, and each is
+verified off the leader itself -- its key files, the chain it presents, the DH
+parameters nginx serves -- rather than off the bin/dap step having run. Custom
+certificates allow at most 2 standbys, because the generated certificate names
+no more.
 
 Podman is not supported: use bin/podman-dap directly.
 
@@ -158,9 +168,13 @@ function _resolve_spec {
 function _read_spec {
   local resolved="$1"
 
-  IFS=$'\t' read -r SPEC_VERSION SPEC_STANDBYS SPEC_AUTO_FAILOVER SPEC_FOLLOWERS SPEC_SAMPLE_DATA \
+  IFS=$'\t' read -r SPEC_VERSION SPEC_STANDBYS SPEC_AUTO_FAILOVER \
+    SPEC_MASTER_KEY_ENCRYPTION SPEC_CUSTOM_CERTIFICATES SPEC_GENERATE_DH \
+    SPEC_FOLLOWERS SPEC_SAMPLE_DATA \
     <<< "$(jq --raw-output \
-      '[.version, .leader.standbys, .leader.auto_failover, .followers, .sample_data] | @tsv' \
+      '[.version, .leader.standbys, .leader.auto_failover,
+        .leader.master_key_encryption, .leader.custom_certificates, .leader.generate_dh,
+        .followers, .sample_data] | @tsv' \
       <<< "$resolved")"
 }
 
@@ -580,12 +594,55 @@ function _provision_commands {
   if (( SPEC_STANDBYS > 0 )); then
     leader+=(--standby-count "$SPEC_STANDBYS")
   fi
+
+  # A modifier of this command rather than a step of its own: bin/dap copies the
+  # pre-generated files/dhparam.pem to where `evoke configure master` looks for DH
+  # parameters, and --generate-dh copies it somewhere else instead, so configure
+  # finds none and has the appliance generate its own. Configure is the only time
+  # that choice is made.
+  if [[ "$SPEC_GENERATE_DH" == true ]]; then
+    leader+=(--generate-dh)
+  fi
   echo "${leader[*]} --provision-master"
 
   # bin/dap returns as soon as `evoke configure master` does, which is before
   # the appliance serves traffic. Everything after this point needs a healthy
   # leader.
   echo 'bin/dap --wait-for-master'
+
+  # The leader is hardened before anything is seeded from it, because a seed
+  # carries the leader's certificates, keys and DH parameters to whatever it
+  # seeds: a standby or follower seeded first would come up with the self-signed
+  # certificates, plaintext keys or bootstrap parameters, and stay that way.
+
+  # `evoke ca import` replaces certificates the leader already has, so it needs a
+  # configured leader. It also imports the follower's certificate into the leader,
+  # which is how a follower seeded later gets it. No --version: it runs the
+  # certificate generator, which pins its own, and then only execs into the
+  # leader.
+  if [[ "$SPEC_CUSTOM_CERTIFICATES" == true ]]; then
+    echo 'bin/dap --import-custom-certificates'
+  fi
+
+  # After the certificates, so the keys they import are encrypted along with the
+  # rest: imported afterwards, a key lands on disk in plaintext beside ones that
+  # are not, and the leader still reports itself healthy. Before any seed, because
+  # bin/dap configures a standby or follower with the master key only if the
+  # leader already has one. Unlocking the keys restarts nginx, postgres and conjur,
+  # hence the second wait.
+  if [[ "$SPEC_MASTER_KEY_ENCRYPTION" == true ]]; then
+    echo 'bin/dap --enable-mke'
+    echo 'bin/dap --wait-for-master'
+  fi
+
+  # Configure does not generate the DH parameters itself. It installs an RFC 3526
+  # group tagged `BOOTSTRAP PARAMETERS` and starts the generation in the
+  # background, at idle priority, swapping the result in when it finishes -- so a
+  # leader that is healthy is not yet a leader with generated parameters, and a
+  # standby seeded from it now would inherit the bootstrap group.
+  if [[ "$SPEC_GENERATE_DH" == true ]]; then
+    echo 'bin/dap --wait-for-dh-params'
+  fi
 
   # Brings each standby up, seeds it from the leader, starts synchronous
   # replication, and swaps the leader load balancer onto its multi-node
@@ -654,6 +711,27 @@ function _check_descriptions {
   echo 'leader /health reports ok'
   echo 'leader /info reports its configuration'
   echo "leader image tag is $SPEC_VERSION"
+
+  # Checked either way, like auto-failover: a hardened leader the spec did not ask
+  # for is as much a different environment as the reverse.
+  if [[ "$SPEC_MASTER_KEY_ENCRYPTION" == true ]]; then
+    echo 'leader server keys are encrypted with a master key'
+  else
+    echo 'leader server keys are not encrypted with a master key'
+  fi
+
+  if [[ "$SPEC_CUSTOM_CERTIFICATES" == true ]]; then
+    echo 'leader presents a certificate issued by the custom CA'
+  else
+    echo 'leader presents a certificate issued by its own appliance CA'
+  fi
+
+  if [[ "$SPEC_GENERATE_DH" == true ]]; then
+    echo 'leader DH parameters were generated by the leader'
+  else
+    echo 'leader DH parameters are the pre-generated files/dhparam.pem'
+  fi
+
   echo "standbys running is $SPEC_STANDBYS"
 
   for number in $(_standby_numbers); do
@@ -724,11 +802,14 @@ function _print_plan {
   echo "Plan for $spec_file"
   echo
   echo 'Resolved spec:'
-  printf '  %-20s %s\n' 'version' "$SPEC_VERSION"
-  printf '  %-20s %s\n' 'leader.standbys' "$SPEC_STANDBYS"
-  printf '  %-20s %s\n' 'leader.auto_failover' "$SPEC_AUTO_FAILOVER"
-  printf '  %-20s %s\n' 'followers' "$SPEC_FOLLOWERS"
-  printf '  %-20s %s\n' 'sample_data' "$SPEC_SAMPLE_DATA"
+  printf '  %-28s %s\n' 'version' "$SPEC_VERSION"
+  printf '  %-28s %s\n' 'leader.standbys' "$SPEC_STANDBYS"
+  printf '  %-28s %s\n' 'leader.auto_failover' "$SPEC_AUTO_FAILOVER"
+  printf '  %-28s %s\n' 'leader.master_key_encryption' "$SPEC_MASTER_KEY_ENCRYPTION"
+  printf '  %-28s %s\n' 'leader.custom_certificates' "$SPEC_CUSTOM_CERTIFICATES"
+  printf '  %-28s %s\n' 'leader.generate_dh' "$SPEC_GENERATE_DH"
+  printf '  %-28s %s\n' 'followers' "$SPEC_FOLLOWERS"
+  printf '  %-28s %s\n' 'sample_data' "$SPEC_SAMPLE_DATA"
   echo
   echo 'Preflight:'
   _preflight_descriptions | _numbered
@@ -940,6 +1021,119 @@ function _leader_image_tag {
   echo "${image##*:}"
 }
 
+# Whether the leader's server keys are encrypted, read off the key files rather
+# than off `bin/dap --enable-mke` having run. `evoke keys encrypt` replaces each
+# `.key` with a `.key.enc`, and unlocking puts back only a symlink into /dev/shm,
+# so symlinks are there either way and it is the regular files that answer:
+# plaintext `.key` files mean unencrypted, `.key.enc` ones encrypted, and both at
+# once a key that arrived after encryption. A dangling symlink (%Y of N) is an
+# encrypted key nobody has unlocked since /dev/shm was last emptied.
+#
+# One find for the whole of /opt/conjur/etc, as `%y%Y path`: the keys live at up
+# to three levels (ssl/external/<host>.key), and that is where evoke puts them.
+function _leader_key_encryption_state {
+  local listing
+  local plaintext=false
+  local encrypted=false
+  local locked=false
+  local kind
+  local path
+
+  listing="$(docker compose exec -T "$(_node_host 1)" \
+    find /opt/conjur/etc -maxdepth 3 '(' -name '*.key' -o -name '*.key.enc' ')' -printf '%y%Y %p\n' \
+    < /dev/null 2> /dev/null || true)"
+
+  while read -r kind path; do
+    case "$kind $path" in
+      'ff '*.key.enc ) encrypted=true ;;
+      'ff '*.key ) plaintext=true ;;
+      'lN '*.key ) locked=true ;;
+    esac
+  done <<< "$listing"
+
+  if [[ "$encrypted" == true && "$plaintext" == true ]]; then
+    echo 'partly encrypted'
+  elif [[ "$encrypted" == true && "$locked" == true ]]; then
+    echo 'locked'
+  elif [[ "$encrypted" == true ]]; then
+    echo 'encrypted'
+  elif [[ "$plaintext" == true ]]; then
+    echo 'not encrypted'
+  else
+    echo 'unreadable'
+  fi
+}
+
+# The CN out of one of s_client's `s:` or `i:` lines. Greedy, so it takes the
+# last CN in the name, which is the one OpenSSL prints for the certificate itself.
+function _common_name {
+  sed -E 's/.*(:|, )CN = ([^,]*).*/\2/'
+}
+
+# The chain the leader load balancer hands a client, classified by who issued the
+# leader's certificate: `appliance CA` for the self-signed CA `evoke configure
+# master` creates, whose name carries `OU = Conjur CA`, and `custom CA` for the
+# intermediate bin/generate-certs creates -- its CN read from the same file the
+# generator issues it from, so the two cannot drift apart. The intermediate has
+# to be in the chain as well as named as the issuer, because a client that trusts
+# only the custom root cannot build a path without it.
+#
+# Asked from inside the leader, whose openssl is the appliance's own and whose
+# name for the load balancer is the one clients use; the host's openssl might be
+# LibreSSL, which prints the chain differently.
+function _leader_certificate_state {
+  local handshake
+  local issuer
+  local intermediate
+
+  handshake="$(docker compose exec -T "$(_node_host 1)" \
+    openssl s_client -connect conjur-master.mycompany.local:443 \
+    -servername conjur-master.mycompany.local < /dev/null 2> /dev/null || true)"
+
+  issuer="$(awk '/^ 0 s:/ { found = 1; next } found && /^   i:/ { print; exit }' <<< "$handshake")"
+  if [[ -z "$issuer" ]]; then
+    echo 'unreachable'
+    return
+  fi
+
+  intermediate="$(jq --raw-output '.CN' artifacts/certificate-generator/configuration/intermediate_ca.json)"
+
+  if [[ "$(_common_name <<< "$issuer")" == "$intermediate" ]]; then
+    if grep '^ 1 s:' <<< "$handshake" | _common_name | grep --quiet --fixed-strings --line-regexp "$intermediate"; then
+      echo 'custom CA'
+    else
+      echo 'no intermediate'
+    fi
+  elif [[ "$issuer" == *'OU = Conjur CA'* ]]; then
+    echo 'appliance CA'
+  else
+    _common_name <<< "$issuer"
+  fi
+}
+
+# Which DH parameters the leader's nginx serves: the pre-generated
+# files/dhparam.pem bin/dap copies in, the RFC 3526 group `evoke configure master`
+# installs as a stand-in and tags so that dhgen.sh knows to replace it, or ones the
+# leader generated itself. The stand-in is the state worth naming -- a leader whose
+# generation never finished is healthy and serving it.
+function _leader_dh_params_state {
+  local params
+
+  params="$(docker compose exec -T "$(_node_host 1)" cat /etc/ssl/dhparam.pem < /dev/null 2> /dev/null || true)"
+
+  if [[ -z "$params" ]]; then
+    echo 'unreadable'
+  elif [[ "$params" == *'BOOTSTRAP PARAMETERS'* ]]; then
+    echo 'bootstrap'
+  elif [[ "$params" == "$(cat files/dhparam.pem)" ]]; then
+    echo 'pre-generated'
+  elif [[ "$params" == *'-----BEGIN DH PARAMETERS-----'* ]]; then
+    echo 'generated'
+  else
+    echo 'unrecognised'
+  fi
+}
+
 # Whether one standby is actually receiving WAL from the leader, which is a
 # different question from whether its container is up.
 #
@@ -1059,6 +1253,21 @@ function _verify {
   _check 'leader health' 'ok' "$(_leader_health)"
   _check 'leader /info' 'reported' "$(_leader_info_state "$cluster_name")"
   _check 'leader image tag' "$SPEC_VERSION" "$(_leader_image_tag)"
+
+  # Each read off the leader itself -- its key files, the chain its load balancer
+  # hands a client, the file nginx takes its DH parameters from -- rather than off
+  # the bin/dap step having run, and each checked whichever way the spec set it.
+  local encryption='not encrypted'
+  local certificate='appliance CA'
+  local dh_params='pre-generated'
+  [[ "$SPEC_MASTER_KEY_ENCRYPTION" == true ]] && encryption='encrypted'
+  [[ "$SPEC_CUSTOM_CERTIFICATES" == true ]] && certificate='custom CA'
+  [[ "$SPEC_GENERATE_DH" == true ]] && dh_params='generated'
+
+  _check 'master key encryption' "$encryption" "$(_leader_key_encryption_state)"
+  _check 'leader certificate' "$certificate" "$(_leader_certificate_state)"
+  _check 'dh parameters' "$dh_params" "$(_leader_dh_params_state)"
+
   _check 'standbys running' "$SPEC_STANDBYS" "$(_running_standbys)"
 
   # Per standby rather than in aggregate: a cluster where one node is up but no

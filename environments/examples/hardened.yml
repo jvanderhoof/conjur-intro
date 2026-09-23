@@ -1,0 +1,41 @@
+# A production-shaped cluster: a leader with custom certificates and master key
+# encryption, two standbys in an auto-failover cluster, and a follower -- the
+# topology for reproducing anything about certificate trust, locked keys, or how
+# either survives seeding.
+#
+#   bin/env --plan environments/examples/hardened.yml
+#   bin/env environments/examples/hardened.yml
+#
+# The three hardening options are independent booleans, each off by default, and
+# each is applied to the leader after it is configured and before anything is
+# seeded from it -- a seed carries the leader's keys, certificates and DH
+# parameters to whatever it seeds. Certificates go in before encryption, so the
+# keys they import are encrypted along with the rest.
+#
+# Custom certificates come from bin/generate-certs, whose leader certificate names
+# conjur-master-1 through conjur-master-3 only, so the schema allows at most two
+# standbys alongside them. The CA it creates is written under
+# system/configuration/certificates, which is gitignored.
+#
+# generate_dh is left off here, and not by accident: on 5.0-stable the appliance's
+# own generator (/etc/my_init.d/dhgen.sh) runs `openssl dhparam 3072 -out ...`,
+# which OpenSSL 3 refuses, so the leader keeps its RFC 3526 bootstrap parameters
+# and provisioning stops at `bin/dap --wait-for-dh-params` with the generator's
+# log. Set it on an appliance whose generator works, or to reproduce that failure.
+#
+# Quote the version. Unquoted `13.5` is a YAML number, and unquoted `13.10`
+# would silently become 13.1.
+version: "5.0-stable"
+
+leader:
+  standbys: 2
+  auto_failover: true
+  master_key_encryption: true
+  custom_certificates: true
+  generate_dh: false
+
+followers: 1
+
+sample_data: true
+
+# events: []   # reserved seam, deliberately unimplemented -- see the schema

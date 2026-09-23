@@ -9,10 +9,12 @@ single-leader provisioning, verification and fast tests — is in place, and so 
 guard rails: preflight, the refusal to reconcile, `--recreate`, and the podman
 refusal. So are standbys (up to 4) and auto-failover, with the quorum requirement as a
 cross-field schema rule, and one follower with its proxy trust and its own health,
-replication and retrieval checks. The leader-hardening flags, more than one follower,
-and the `conjur-env` skill are not. The schema refuses the topology `bin/env` cannot
-build rather than letting it provision something smaller.
-**Date:** 2026-09-22
+replication and retrieval checks. So are the three leader-hardening flags — master
+key encryption, custom certificates and generated DH parameters — each verified off
+the leader itself. More than one follower, and the `conjur-env` skill, are not. The
+schema refuses the topology `bin/env` cannot build rather than letting it provision
+something smaller.
+**Date:** 2026-09-23
 **Scope:** Proof of concept. End-to-end first; robustness in later passes.
 
 ## Goal
@@ -66,9 +68,9 @@ version: "13.5"          # quoted: unquoted 13.10 is the YAML number 13.1
 leader:
   standbys: 2            # 0-4, the compose topology's ceiling
   auto_failover: true    # requires standbys >= 2, for an etcd quorum
-  master_key_encryption: true   # not in the schema yet
-  custom_certificates: true     # not in the schema yet
-  generate_dh: false            # not in the schema yet
+  master_key_encryption: true   # encrypt the leader's keys before anything is seeded
+  custom_certificates: true     # bin/generate-certs' CA; requires standbys <= 2
+  generate_dh: false            # the leader generates its own; see known debt
 followers: 1             # 0-1, the compose topology's ceiling
 sample_data: true        # default; runs bin/api --load-sample-policy-and-values
 
@@ -82,9 +84,8 @@ requires a string and the error names the fix.
 
 Each field enters the schema as it becomes buildable, so that
 `additionalProperties: false` keeps meaning "this is supported". Today that is
-`version`, `leader.standbys`, `leader.auto_failover`, `followers`, `sample_data`
-and the reserved `events`; the three leader-hardening flags arrive with the
-ticket that wires them up.
+every field above: `version`, `leader.standbys`, `leader.auto_failover`, the three
+leader-hardening booleans, `followers`, `sample_data` and the reserved `events`.
 
 **A field's accepted *range* widens as `bin/env` learns to build it.** In pass 1
 `standbys` and `followers` were `maximum: 0` and `auto_failover` was
@@ -108,6 +109,14 @@ before the first standby is seeded, and fires identically for a generated spec. 
 surfaces as a bare `minimum of 2` on `/leader/standbys`, so the validator attaches
 the hint that explains the quorum — a range error cannot name the field that
 caused it.
+
+Custom certificates add the second. The leader certificate `bin/generate-certs`
+issues comes from `artifacts/certificate-generator/configuration/dap-master.json`,
+which names the leader and `conjur-master-1` through `conjur-master-3` and nothing
+else, so a third standby would serve a certificate that does not name it. The rule
+is `custom_certificates: true` ⇒ `standbys <= 2`, with a validator hint pointing at
+that file. Widening it is a change to the certificate configuration, not to
+`bin/env`.
 
 The version is also pattern-constrained to docker's tag grammar, because it
 reaches a `bin/dap` command line. A spec file is an input, and no value out of
@@ -313,6 +322,35 @@ it mean anything. (And `set -o pipefail` is why that case exists at all: a jq th
 cannot read its input would otherwise take the run down at the moment verification is
 trying to report.)
 
+The hardening probes follow the same rule, and each reads the leader rather than
+trusting the step that configured it, because every one of these options has a way
+to "succeed" while leaving the leader as it was. All three go through `docker compose
+exec` on the leader, so `docker` is the seam, and each is fed what a real leader
+returned:
+
+- **Master key encryption** lists the key files under `/opt/conjur/etc` with their
+  file types. An encrypted leader has `*.key.enc` files; a plaintext one has `*.key`.
+  A leader whose master key has not been unlocked since a restart has `*.key` as
+  dangling symlinks into a tmpfs, which reads as `locked` rather than `encrypted` —
+  the keys are encrypted, but nothing can use them. A mix reads as `partly
+  encrypted`.
+- **Custom certificates** runs `openssl s_client` from inside the leader against its
+  own name, and reads the issuer of the certificate it actually presents. `evoke ca
+  import` can fail quietly and leave the appliance's self-signed certificate in
+  place, which is exactly what a desired-state check exists to catch, so the row
+  names the issuer: `custom CA` only when the leaf is issued by the intermediate
+  `bin/generate-certs` creates *and* that intermediate is in the chain, `appliance
+  CA` for the self-signed fallback, `no intermediate` for a leaf served without its
+  chain, and otherwise the issuer's own CN.
+- **Generated DH parameters** reads `/etc/ssl/dhparam.pem`, the file nginx serves
+  them from, and tells apart the appliance's RFC 3526 bootstrap file (which carries
+  a `BOOTSTRAP PARAMETERS` tag), the repo's `files/dhparam.pem`, and anything else
+  that is a DH parameter file.
+
+Each was mutation-checked the same way as the probes before them. What the fixtures
+could not provide is a *locked* leader: that case is built from what `find -printf`
+reports for a dangling symlink rather than captured from a restarted MKE leader.
+
 `--plan` therefore serves two needs at once: it is what makes the
 spec→sequence translation testable, and it is what the skill shows before provisioning.
 
@@ -424,6 +462,40 @@ back into a spec.
    argument is asserted in `test/env.bats` precisely because the obvious spelling
    passes against an environment with no follower in it. Worth renaming or splitting
    in `artifacts/api-client/api-script`.
+7. **`generate_dh: true` cannot pass on 5.0-stable.** The appliance's own generator,
+   `/etc/my_init.d/dhgen.sh`, runs `openssl dhparam 3072 -out ...`. OpenSSL 3 (the
+   image ships 3.0.13) wants the options before the size, answers `dhparam: Use -help
+   for summary.` and exits, so the leader keeps its RFC 3526 bootstrap parameters for
+   good. `bin/dap --wait-for-dh-params` used to poll for the full timeout and then
+   report nothing; it now tells a finished generator from a dead one and fails at
+   once with `/var/log/dhgen.log`, and verification reports `bootstrap`. It is not
+   worked around here — generating the file ourselves would make the row pass
+   without the appliance feature it describes working — which is why
+   `environments/examples/hardened.yml` leaves `generate_dh` off. It is an appliance
+   bug, and the fix belongs in the appliance's script.
+8. **Two `bin/dap` fixes the hardening criteria needed.** Both are outside `bin/env`'s
+   remit, and made because a hardened spec could not otherwise provision in one run.
+   - *The leader load balancer's CA went stale on certificate import.* Once standbys
+     exist, HAProxy health-checks the leader with `check-ssl` against a snapshot of
+     the leader's CA, which `bin/dap` copies into `system/haproxy/certs` when it
+     deploys the proxy. After `--import-custom-certificates` that snapshot still
+     holds the appliance CA, every backend fails its check with `SSL handshake
+     failure`, and the leader is unreachable through the load balancer. Import now
+     refreshes the snapshot and reloads the proxy.
+     `_rotate_certificates` very likely has the same problem and was not touched.
+   - *A follower under MKE raced the load balancer.* Seeding a follower from an
+     MKE leader re-encrypts and unlocks the *leader's* keys, which restarts its
+     nginx, and `evoke configure follower` then ran while HAProxy was still marking
+     the leader down, failing with `Replication connection could not be
+     established`. `_setup_follower` now waits for the leader to be healthy through
+     the load balancer first.
+   - *Verification raced proxy trust.* `evoke proxy add` returns before the
+     follower's services restart to pick the proxy up, so on a fast run the
+     follower rows read a follower that was briefly down — `follower health not
+     ok` and `follower secret read not retrievable`, on a follower that was fine
+     ten seconds later. Nothing about this is specific to hardening; the hardened
+     run just reached verification sooner. `--trust-follower-proxy` now waits for
+     the follower to be healthy again before returning.
 
 ---
 
@@ -452,3 +524,5 @@ back into a spec.
 | KB access | Vendored reference | No path dependency on a single machine's clone. |
 | Skill gate | One gate: spec, gaps, plan, destruction warning | Folds the destructive confirm into the same decision point. |
 | Unstated dimensions | Ask about every one | A repro is worth the extra turns; there are only a handful of fields. |
+| Hardening verification | Read the leader's key files, presented chain and DH file | Each option can "succeed" while leaving the leader as it was; a silent fallback has to fail a row. |
+| Appliance DH bug | Surfaced, not worked around | Generating the file ourselves would make the row pass without the feature it describes. |
