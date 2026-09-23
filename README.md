@@ -183,7 +183,7 @@ version: "5.0-stable"
 ```
 
 Everything else takes a documented default: one leader, no standbys, no
-followers, no auto-failover, and the sample policy and secrets loaded. Quote the
+follower, no auto-failover, and the sample policy and secrets loaded. Quote the
 version — unquoted `13.10` is the YAML number `13.1`.
 
 The schema is the contract, so an unknown or misspelled key is a hard error
@@ -204,9 +204,12 @@ A leader can have up to four standbys, optionally enrolled in an auto-failover
 cluster — which the schema will not accept with fewer than two of them, because
 an etcd cluster of two nodes cannot elect a new leader when it loses one.
 [`environments/examples/highly-available.yml`](environments/examples/highly-available.yml)
-is the smallest such spec. Followers are not provisioned yet, so the schema
-refuses them outright rather than letting `bin/env` quietly build something
-smaller than you asked for; use `bin/dap` for those until they land.
+is the smallest such spec. It can also have one follower, provisioned and
+proxy-trusted in the same run and verified on its own health, replication and
+secret retrieval —
+[`environments/examples/leader-and-follower.yml`](environments/examples/leader-and-follower.yml).
+A second follower would need new compose services, so the schema refuses it rather
+than letting `bin/env` quietly build something smaller than you asked for.
 
 Nothing is reconciled. A preflight checks up front that the appliance version
 resolves and the host ports are free, and an environment that already exists is

@@ -78,14 +78,6 @@ def problems(validator, document):
     return sorted(found)
 
 
-# Topology the schema describes but bin/env cannot build yet. The ceiling is 0
-# so that validating and being buildable stay the same thing; without these
-# hints the operator would see a bare range error and have no idea why.
-NOT_IMPLEMENTED = {
-    "/followers": "followers are not provisioned yet",
-}
-
-
 def hint_for(pointer, message):
     """Extra guidance for mistakes the schema can detect but not explain."""
     if pointer == "/version" and "is not of type 'string'" in message:
@@ -127,10 +119,14 @@ def hint_for(pointer, message):
             "services"
         )
 
-    if pointer in NOT_IMPLEMENTED and ("maximum of 0" in message or "expected" in message):
+    # The same shape one tier down, and the same thing a bare range error cannot
+    # say: a second follower needs generated config as well as a new compose
+    # service, which is why the ceiling is where it is.
+    if pointer == "/followers" and "greater than the maximum" in message:
         return (
-            f"{NOT_IMPLEMENTED[pointer]}; build this by hand with bin/dap for now, "
-            "and see docs/environments.md"
+            "docker-compose.yml defines a single conjur-follower-1, and the "
+            "follower load balancer is configured with one backend server, so more "
+            "followers would need new compose services and generated proxy config"
         )
 
     return None

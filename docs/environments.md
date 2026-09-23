@@ -118,7 +118,7 @@ fails loudly instead.
 | `version` | string, **required** | — | An appliance image tag, as passed to `bin/dap --version`. Letters, digits, dots, dashes, underscores. |
 | `leader.standbys` | integer | `0` | `0`–`4` — [see below](#standbys-and-auto-failover) |
 | `leader.auto_failover` | boolean | `false` | `true` needs at least 2 standbys — [see below](#standbys-and-auto-failover) |
-| `followers` | integer | `0` | `0` only — [see below](#not-supported-yet) |
+| `followers` | integer | `0` | `0`–`1` — [see below](#followers) |
 | `sample_data` | boolean | `true` | Loads the sample policy and variable values via `bin/api --load-sample-policy-and-values`. |
 | `events` | array | — | `[]` only. Reserved seam for transitions (upgrades, promotions, failovers); **not implemented**. |
 
@@ -188,6 +188,76 @@ Expect 10–20 minutes for a two-standby cluster, most of it in
 cluster's members, so `git status` shows it modified after the run. That is
 `bin/dap`'s behaviour, not `bin/env`'s; `git checkout policy/cluster.yml` once
 the environment is up.
+
+## Followers
+
+A leader with one follower is
+[`environments/examples/leader-and-follower.yml`](../environments/examples/leader-and-follower.yml):
+
+```yaml
+version: "5.0-stable"
+
+followers: 1
+```
+
+**Asking for a follower is the whole request.** `bin/env` provisions it and then
+configures its proxy trust in the same run, so there is no manual follow-up step:
+
+```
+Commands:
+  1. bin/dap --version 5.0-stable --provision-master
+  2. bin/dap --wait-for-master
+  3. bin/dap --version 5.0-stable --provision-follower
+  4. bin/dap --trust-follower-proxy
+  5. bin/api --load-sample-policy-and-values
+```
+
+`--trust-follower-proxy` tells the *follower* to trust the `X-Forwarded-For` its
+load balancer sets, so that audit records and IP-restricted host identities see the
+real client rather than the load balancer's own address. It is not a reachability
+step — a follower serves secrets without it — but it is the kind of difference that
+decides whether an authorization repro behaves like the customer's environment.
+Confirm it with
+`docker compose exec conjur-follower-1.mycompany.local evoke proxy list`, which
+should name the follower load balancer, `12.16.23.16`.
+
+**The follower goes in before the sample data**, and that is deliberate.
+`evoke seed follower` snapshots the leader's database, so a follower seeded *after*
+the secrets would serve them out of its own snapshot whether or not replication
+ever started — and the retrieve-through-the-follower check below would pass on a
+follower that is not replicating at all. Seeded first, the sample secret can only
+reach the follower by replicating.
+
+With standbys and auto-failover in the same spec, the follower goes in after
+enrolment: `evoke configure follower` installs the failover rebaser, which is what
+repoints the follower at a newly promoted leader, so the cluster wants to exist by
+the time the follower is configured against it.
+
+**The ceiling is one follower**, and it is the compose topology's again —
+`docker-compose.yml` defines a single `conjur-follower-1`, and the follower load
+balancer is configured with one backend server, so a second needs generated proxy
+config as well as a new compose service:
+
+```
+bin/env: spec error at /followers: 2 is greater than the maximum of 1
+bin/env:   hint: docker-compose.yml defines a single conjur-follower-1, and the follower load balancer is configured with one backend server, so more followers would need new compose services and generated proxy config
+bin/env: the spec was not accepted, so nothing was provisioned.
+```
+
+**The follower tier takes four more host ports**, so they join preflight: 80, 449
+and 7001 for the load balancer, and 450 for the follower appliance itself. A spec
+with a follower checks `443, 444, 7000, 80, 449, 450, 7001`. `CONJUR_FOLLOWER_PORT`
+moves 450; the other three are fixed in `docker-compose.yml`. Port **80** is the one
+most likely to already be in use on a developer's machine, which is why it is
+checked rather than discovered when compose fails.
+
+**A follower is verified independently of the leader**, on three rows rather than
+one — see [Reading the verification table](#reading-the-verification-table). The
+pair that matters is health and replication: a follower whose replication stopped
+right after it was seeded is up, reports itself healthy, and keeps serving data that
+is quietly out of date.
+
+Expect 5–10 minutes for the follower on top of the leader's own time.
 
 ## The schema is the contract
 
@@ -369,6 +439,24 @@ Verification
   sample data            loaded           loaded           ok
 ```
 
+A follower adds three rows of its own, none of which the leader can answer for:
+
+```
+Verification
+
+  DIMENSION              DESIRED          ACTUAL           RESULT
+  leader health          ok               ok               ok
+  leader /info           reported         reported         ok
+  leader image tag       5.0-stable       5.0-stable       ok
+  standbys running       0                0                ok
+  followers running      1                1                ok
+  follower health        ok               ok               ok
+  follower replication   replicating      replicating      ok
+  follower secret read   retrievable      retrievable      ok
+  auto-failover          false            false            ok
+  sample data            loaded           loaded           ok
+```
+
 What the dimensions mean:
 
 - **leader health** — `/health` reports ok. `unreachable` means nothing answered
@@ -395,6 +483,36 @@ What the dimensions mean:
   it returns, so a standby still catching up at verification time is a real finding,
   and the distinction between "behind" and "not connected" is the first thing you
   want to know.
+- **follower health** — `/health` on the follower's *own* port, not through the
+  follower load balancer and not through the leader. The leader answers `/health`
+  too, and answers it `ok`, so this row only means something because it asks the
+  follower directly. Only shown when `followers` is 1.
+- **follower replication** — the follower's own view of its pglogical
+  subscriptions, under `/health`. Followers replicate *logically*, so they have no
+  row in the leader's `pg_stat_replication` — this is not the standby check with a
+  different host. Read from the follower rather than the leader for two reasons: it
+  still answers when the leader is unreachable, and it can tell receiving changes
+  apart from applying them. The desired state is `replicating`. The others:
+  `not replicating` (configured as a follower, subscribed to nothing — what a
+  follower whose `evoke configure follower` never completed looks like),
+  `initial sync` (still copying the leader's database), `disabled` (the
+  subscription exists but is not running, which is what `evoke replication stop`
+  leaves behind), `apply errors` and `sync errors` (receiving changes and failing
+  on them — the case the leader's own view would call `streaming`), and
+  `not a follower` (the appliance answered, but it is not a follower). One state it
+  cannot see: a subscription that is enabled and error-free but stalled — receiving
+  nothing and reporting nothing wrong — reads as `replicating`. The row is built from
+  the subscriptions' enabled and error fields, not from `received_lsn` or
+  `last_msg_receipt_time`, because every healthy follower is some microseconds behind
+  the leader and a threshold on that would fail runs at random. The
+  `follower secret read` row is the thing that catches a stalled follower in practice:
+  it reads a secret that could only have arrived by replicating. Only shown when
+  `followers` is 1.
+- **follower secret read** — the sample secret fetched back *through the follower
+  load balancer*, which is the only row that authenticates and the only one that
+  goes through the load balancer rather than straight at the appliance. A follower
+  whose health is ok and whose replication is current is still useless if nothing can
+  authenticate against it. Shown when `followers` is 1 and `sample_data` is true.
 - **auto-failover** — whether the leader is clustered at all, read from the cluster
   name under `/info`, the same way the rest of `bin/dap` detects a cluster. A
   cluster under an unexpected name is reported as `cluster <name>` rather than
@@ -427,21 +545,19 @@ schema and the sanitized examples are tracked. If you add an example, sanitize i
 
 ## Not supported yet
 
-Followers are **refused by the schema**, rather than quietly built smaller than
-you asked for:
-
-```
-bin/env: spec error at /followers: 1 is greater than the maximum of 0
-bin/env:   hint: followers are not provisioned yet; build this by hand with bin/dap for now, and see docs/environments.md
-bin/env: the spec was not accepted, so nothing was provisioned.
-```
-
-Each field's ceiling rises as `bin/env` learns to build it, so "this spec
-validates" and "this spec can be provisioned" stay the same claim. Until then,
-use `bin/dap --provision-follower` by hand.
+Every field's ceiling is the topology `bin/env` can actually build, and it rises as
+`bin/env` learns to build more — so "this spec validates" and "this spec can be
+provisioned" stay the same claim. Asking for more than a ceiling is a schema error
+naming what raising it would take, rather than a topology quietly built smaller
+than you asked for: at most 4 standbys
+([see above](#standbys-and-auto-failover)) and at most 1 follower
+([see above](#followers)). Beyond those, use `bin/dap` by hand.
 
 Also not supported, by design or by not-yet:
 
+- **More than one follower.** One `conjur-follower-1` in `docker-compose.yml`, and
+  one backend server in the follower load balancer's config. A second needs both a
+  new compose service and proxy config generated per follower.
 - **Transitions.** `events:` is a reserved key, not a feature. Upgrades,
   promotions and triggered failovers are run by hand with `bin/dap`.
 - **Convergence.** There is no reconcile, by design: `bin/env` builds from clean
@@ -498,6 +614,51 @@ it carries the hostname. `application_name` is an opaque `standby_<hex>_<hex>`.
 Port 443 is the leader load balancer (`CONJUR_MASTER_PORT`), which is what `bin/env`
 probes; going direct to 444 asks conjur-master-1 specifically, which is a different
 question after a failover.
+
+**`follower replication … not replicating`** (or `disabled`, `apply errors`,
+`sync errors`) — the follower is up and healthy but is not applying the leader's
+changes, which means it is serving whatever it had when it was seeded. Its own view
+is the authority, and this is the exact read behind the row:
+
+```sh
+curl -sk https://localhost:450/health \
+  | jq '.database.logical_replication_status'
+```
+
+Port 450 is the follower appliance itself (`CONJUR_FOLLOWER_PORT`), which is what
+`bin/env` probes. Asking the *leader* on 443 is a different question and gives a
+misleading answer: it replies with `"subscriptions": "Subscriptions are only
+available on Conjur Followers."`, a sentence rather than a list, which is why the row
+reads `not a follower` if the probe is ever pointed at the wrong port. Followers
+replicate logically, so there is nothing about them in the leader's
+`pg_stat_replication` — do not go looking there.
+
+**`follower secret read … not retrievable` while the other follower rows pass.** The
+follower itself is healthy and current, so the problem is in front of it — the
+follower load balancer, or authentication. It is the only follower row that goes
+through the load balancer, so compare it against the appliance directly:
+
+```sh
+curl -sk https://localhost:449/health   # through the load balancer
+curl -sk https://localhost:450/health   # the follower itself
+```
+
+Proxy trust is *not* the cause: without it the read still works, and the audit
+records simply attribute it to the load balancer's address.
+
+**Audit records or IP-restricted hosts see the load balancer's address, not the
+client's.** Proxy trust did not take. No verification row covers it — nothing the
+follower answers reports its trusted proxies — so check it by hand:
+
+```sh
+docker compose exec conjur-follower-1.mycompany.local evoke proxy list
+```
+
+It should name `12.16.23.16`, the follower load balancer. Anything else, or `No
+proxies`, and `docker compose exec conjur-follower-1.mycompany.local evoke proxy
+add 12.16.23.16` sets it. An environment provisioned before this was fixed has
+`12.16.23.15` — `conjur-master-5`, which never forwards to the follower — so the
+address needs replacing rather than adding to.
 
 **`cluster member N … missing`** — the node is not in etcd's member list even
 though the leader reports a cluster. `docker compose exec

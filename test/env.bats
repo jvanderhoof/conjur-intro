@@ -14,7 +14,7 @@ setup_file() {
 
   # Build the validator up front so the first test is not timed with a docker
   # build in it.
-  docker build --quiet --tag conjur-intro/env-validator:1 artifacts/env-validator > /dev/null
+  docker build --quiet --tag conjur-intro/env-validator:2 artifacts/env-validator > /dev/null
 }
 
 setup() {
@@ -161,6 +161,123 @@ bin/dap --wait-for-master
 bin/dap --version 13.5 --standby-count 2 --provision-standbys
 bin/dap --standby-count 2 --enable-auto-failover
 bin/api --load-sample-policy-and-values' ]
+}
+
+@test "a follower is provisioned after the leader, and proxy trust follows it" {
+  spec 'version: "13.5"' 'followers: 1'
+
+  run bin/env --plan "$SPEC"
+
+  [ "$status" -eq 0 ]
+
+  # The follower before the sample data, and not only because the feature suite
+  # provisions a production topology in that order: `evoke seed follower` snapshots
+  # the leader's database, so a follower seeded after the sample data would serve
+  # that secret out of its own snapshot whether or not replication ever worked --
+  # and the retrievability check below it would pass on a broken follower.
+  [ "$(plan_commands)" = 'bin/dap --version 13.5 --provision-master
+bin/dap --wait-for-master
+bin/dap --version 13.5 --provision-follower
+bin/dap --trust-follower-proxy
+bin/api --load-sample-policy-and-values' ]
+}
+
+@test "the tracked leader-and-follower example plans a follower and its proxy trust" {
+  run bin/env --plan environments/examples/leader-and-follower.yml
+
+  [ "$status" -eq 0 ]
+  [ "$(plan_commands)" = 'bin/dap --version 5.0-stable --provision-master
+bin/dap --wait-for-master
+bin/dap --version 5.0-stable --provision-follower
+bin/dap --trust-follower-proxy
+bin/api --load-sample-policy-and-values' ]
+}
+
+# Same trap as the standbys: --provision-follower brings conjur-follower-1 up, and
+# compose resolves its image from VERSION, so a follower command without the
+# version gets bin/dap's own default -- a 13.5 leader with a 5.0-stable follower.
+# --trust-follower-proxy starts nothing, so it needs no version.
+@test "the follower is provisioned from the version in the spec, not bin/dap's default" {
+  spec 'version: "13.5"' 'followers: 1'
+
+  run bin/env --plan "$SPEC"
+
+  [ "$status" -eq 0 ]
+  [[ "$(plan_commands)" == *'bin/dap --version 13.5 --provision-follower'* ]]
+  [[ "$(plan_commands)" != *'--version 13.5 --trust-follower-proxy'* ]]
+}
+
+@test "a follower is provisioned after auto-failover enrolment, not before it" {
+  spec 'version: "13.5"' 'leader:' '  standbys: 2' '  auto_failover: true' 'followers: 1'
+
+  run bin/env --plan "$SPEC"
+
+  [ "$status" -eq 0 ]
+
+  # `evoke configure follower` installs the failover rebaser service, which is
+  # what repoints the follower at a newly promoted leader, so the cluster wants to
+  # exist before the follower is configured against it.
+  [ "$(plan_commands)" = 'bin/dap --version 13.5 --standby-count 2 --provision-master
+bin/dap --wait-for-master
+bin/dap --version 13.5 --standby-count 2 --provision-standbys
+bin/dap --standby-count 2 --enable-auto-failover
+bin/dap --version 13.5 --provision-follower
+bin/dap --trust-follower-proxy
+bin/api --load-sample-policy-and-values' ]
+}
+
+@test "a spec with no follower plans neither follower command" {
+  spec 'version: "13.5"'
+
+  run bin/env --plan "$SPEC"
+
+  [ "$status" -eq 0 ]
+  [[ "$(plan_commands)" != *'follower'* ]]
+}
+
+@test "plan mode lists the follower checks, including retrieval through it" {
+  spec 'version: "13.5"' 'followers: 1'
+
+  run bin/env --plan "$SPEC"
+
+  [ "$status" -eq 0 ]
+  [[ "$(plan_checks)" == *'followers running is 1'* ]]
+  [[ "$(plan_checks)" == *'follower /health reports ok'* ]]
+  [[ "$(plan_checks)" == *'follower is replicating from the leader'* ]]
+  [[ "$(plan_checks)" == *'retrievable through the follower'* ]]
+}
+
+@test "a spec with no follower lists no follower checks beyond the count" {
+  spec 'version: "13.5"'
+
+  run bin/env --plan "$SPEC"
+
+  [ "$status" -eq 0 ]
+  [[ "$(plan_checks)" == *'followers running is 0'* ]]
+  [[ "$(plan_checks)" != *'follower /health'* ]]
+  [[ "$(plan_checks)" != *'through the follower'* ]]
+}
+
+@test "the follower tier's own host ports are part of preflight" {
+  spec 'version: "13.5"' 'followers: 1'
+
+  run bin/env --plan "$SPEC"
+
+  [ "$status" -eq 0 ]
+
+  # 80, 449 and 7001 are the follower load balancer's; 450 is the follower
+  # appliance published directly. Grouped after the leader's rather than sorted in,
+  # so the list reads as one tier then the other.
+  [[ "$(plan_preflight)" == *'host ports 443, 444, 7000, 80, 449, 450, 7001 are free'* ]]
+}
+
+@test "the follower ports stay out of preflight when no follower is asked for" {
+  spec 'version: "13.5"'
+
+  run bin/env --plan "$SPEC"
+
+  [ "$status" -eq 0 ]
+  [[ "$(plan_preflight)" == *'host ports 443, 444, 7000 are free'* ]]
 }
 
 @test "disabling sample data drops both loading it and checking it" {
@@ -461,19 +578,32 @@ bin/api --load-sample-policy-and-values' ]
 }
 
 #
-## Topology this pass cannot build yet
+## The follower tier -- how far the schema lets a spec go
 #
-# Same mechanism as the ceiling above, for a dimension that has no supported
-# range at all yet.
+# Same mechanism again, one tier down. docker-compose.yml defines a single
+# conjur-follower-1, and the follower load balancer's haproxy.cfg names one
+# backend, so a second follower needs generated config as well as a new compose
+# service. Two is refused here rather than provisioning one follower and
+# reporting a mismatch for the other.
 
-@test "a follower is refused by the schema" {
-  spec 'version: "13.5"' 'followers: 1'
+@test "more followers than the compose topology defines is a schema error" {
+  spec 'version: "13.5"' 'followers: 2'
 
   run bin/env --plan "$SPEC"
 
   [ "$status" -ne 0 ]
   [[ "$output" == *'/followers'* ]]
-  [[ "$output" == *'followers are not provisioned yet'* ]]
+  [[ "$output" == *'maximum of 1'* ]]
+  [[ "$output" == *'conjur-follower-1'* ]]
+  [[ "$output" == *'nothing was provisioned'* ]]
+}
+
+@test "the largest follower count the compose topology supports validates" {
+  spec 'version: "13.5"' 'followers: 1'
+
+  run bin/env --plan "$SPEC"
+
+  [ "$status" -eq 0 ]
 }
 
 #
@@ -1061,6 +1191,181 @@ JSON
   [[ "$(rows)" == *'standby 3 replication streaming not replicating MISMATCH'* ]]
 }
 
+@test "verification reports the follower's health and replication as rows of their own" {
+  spec 'version: "13.5"' 'followers: 1'
+
+  BIN_ENV_SOURCE_ONLY=1 source bin/env
+  _read_spec "$(_resolve_spec "$SPEC")"
+
+  _running_followers() {
+    echo 1
+  }
+  _follower_health() {
+    echo ok
+  }
+  _follower_replication_state() {
+    echo replicating
+  }
+  _follower_secret_state() {
+    echo retrievable
+  }
+  _leader_health() {
+    echo ok
+  }
+  _leader_cluster_name() {
+    echo none
+  }
+  _leader_image_tag() {
+    echo 13.5
+  }
+  _sample_data_state() {
+    echo loaded
+  }
+
+  run _verify
+
+  # The one test here that asserts a clean exit, so that the follower rows are shown
+  # to be capable of passing and not only of mismatching.
+  [ "$status" -eq 0 ]
+  [[ "$(rows)" == *'followers running 1 1 ok'* ]]
+  [[ "$(rows)" == *'follower health ok ok ok'* ]]
+  [[ "$(rows)" == *'follower replication replicating replicating ok'* ]]
+  [[ "$(rows)" == *'follower secret read retrievable retrievable ok'* ]]
+}
+
+@test "a follower that is up but behind fails verification while the leader passes" {
+  spec 'version: "13.5"' 'followers: 1'
+
+  BIN_ENV_SOURCE_ONLY=1 source bin/env
+  _read_spec "$(_resolve_spec "$SPEC")"
+
+  # The container is up and the appliance calls itself healthy, so the count and the
+  # health row both agree with the spec. Replication is the only thing that does not
+  # -- every other row is stubbed to pass, which is what makes the non-zero status
+  # below say something about the follower rather than about an unstubbed probe.
+  _running_followers() {
+    echo 1
+  }
+  _follower_health() {
+    echo ok
+  }
+  _follower_replication_state() {
+    echo 'apply errors'
+  }
+  _follower_secret_state() {
+    echo retrievable
+  }
+  _leader_health() {
+    echo ok
+  }
+  _leader_cluster_name() {
+    echo none
+  }
+  _leader_image_tag() {
+    echo 13.5
+  }
+  _sample_data_state() {
+    echo loaded
+  }
+
+  run _verify
+
+  [ "$status" -ne 0 ]
+  [ "$(rows | grep --count MISMATCH)" -eq 1 ]
+  [[ "$(rows)" == *'leader health ok ok ok'* ]]
+  [[ "$(rows)" == *'follower health ok ok ok'* ]]
+  [[ "$(rows)" == *'follower replication replicating apply errors MISMATCH'* ]]
+}
+
+@test "a follower serving a stale snapshot is caught even though the secret reads back" {
+  spec 'version: "13.5"' 'followers: 1'
+
+  BIN_ENV_SOURCE_ONLY=1 source bin/env
+  _read_spec "$(_resolve_spec "$SPEC")"
+
+  # `evoke seed follower` snapshots the leader's database, so a follower whose
+  # replication stopped straight afterwards still answers for every secret that
+  # existed at seed time. Retrievability alone would report this environment as good.
+  _running_followers() {
+    echo 1
+  }
+  _follower_health() {
+    echo ok
+  }
+  _follower_replication_state() {
+    echo disabled
+  }
+  _follower_secret_state() {
+    echo retrievable
+  }
+  _leader_health() {
+    echo ok
+  }
+  _leader_cluster_name() {
+    echo none
+  }
+  _leader_image_tag() {
+    echo 13.5
+  }
+  _sample_data_state() {
+    echo loaded
+  }
+
+  run _verify
+
+  [ "$status" -ne 0 ]
+  [ "$(rows | grep --count MISMATCH)" -eq 1 ]
+  [[ "$(rows)" == *'follower secret read retrievable retrievable ok'* ]]
+  [[ "$(rows)" == *'follower replication replicating disabled MISMATCH'* ]]
+}
+
+@test "a follower the spec did not ask for gets no follower rows beyond the count" {
+  spec 'version: "13.5"' 'sample_data: false'
+
+  BIN_ENV_SOURCE_ONLY=1 source bin/env
+  _read_spec "$(_resolve_spec "$SPEC")"
+
+  # A follower left running from an earlier environment. The count row reports it, so
+  # it is not hidden, but the spec asked for no follower and so there is nothing for
+  # the health, replication or retrieval rows to be desired against.
+  _running_followers() {
+    echo 1
+  }
+
+  run _verify
+
+  [ "$status" -ne 0 ]
+  [[ "$(rows)" == *'followers running 0 1 MISMATCH'* ]]
+  [[ "$(rows)" != *'follower health'* ]]
+  [[ "$(rows)" != *'follower replication'* ]]
+  [[ "$(rows)" != *'follower secret read'* ]]
+}
+
+# Retrieval through the follower is a claim about the sample data, so it only means
+# something when the spec asked for the sample data to be there.
+@test "a follower in a spec with no sample data gets no retrieval row" {
+  spec 'version: "13.5"' 'followers: 1' 'sample_data: false'
+
+  BIN_ENV_SOURCE_ONLY=1 source bin/env
+  _read_spec "$(_resolve_spec "$SPEC")"
+
+  _running_followers() {
+    echo 1
+  }
+  _follower_health() {
+    echo ok
+  }
+  _follower_replication_state() {
+    echo replicating
+  }
+
+  run _verify
+
+  [[ "$(rows)" == *'follower health ok ok ok'* ]]
+  [[ "$(rows)" == *'follower replication replicating replicating ok'* ]]
+  [[ "$(rows)" != *'follower secret read'* ]]
+}
+
 # The other probe whose filter encodes a claim about what the appliance returns,
 # and so the other one that a stub of the probe itself cannot check. The JSON below
 # is what `evoke cluster member list` really printed for a three-node cluster: an
@@ -1376,6 +1681,164 @@ JSON
   [ "$(_leader_image_tag)" = 'unknown' ]
 }
 
+# A follower answers /health on its own port, and the probe has to ask it there.
+# This is the one probe where the payloads below differ between hosts in a way that
+# hides a mistake: the leader answers /health too, and answers it `ok`, so a
+# follower probe pointed at the leader would report a healthy follower whether or
+# not one exists. The stub therefore answers by port rather than unconditionally.
+@test "follower health is read from the follower, not from whatever answers /health" {
+  BIN_ENV_SOURCE_ONLY=1 source bin/env
+
+  # Both bodies as the live pair returned them, trimmed to what the filters see.
+  curl() {
+    case "$*" in
+      *localhost:450* ) echo '{"ok":true,"degraded":false,"role":"follower"}' ;;
+      *localhost:443* ) echo '{"ok":true,"degraded":false,"role":"master"}' ;;
+      * ) return 7 ;;
+    esac
+  }
+
+  [ "$(_follower_health)" = 'ok' ]
+
+  # Only the follower is unhealthy. A probe reading the leader's answer would still
+  # say ok here, which is the whole point of the check.
+  curl() {
+    case "$*" in
+      *localhost:450* ) echo '{"ok":false,"degraded":true,"role":"follower"}' ;;
+      *localhost:443* ) echo '{"ok":true,"degraded":false,"role":"master"}' ;;
+      * ) return 7 ;;
+    esac
+  }
+
+  [ "$(_follower_health)" = 'not ok' ]
+  [ "$(_leader_health)" = 'ok' ]
+
+  # And the follower down while the leader is up, which is the state the whole row
+  # exists to surface.
+  curl() {
+    case "$*" in
+      *localhost:443* ) echo '{"ok":true,"degraded":false,"role":"master"}' ;;
+      * ) return 7 ;;
+    esac
+  }
+
+  [ "$(_follower_health)" = 'unreachable' ]
+}
+
+# Followers replicate logically, over pglogical subscriptions, so there is no row
+# for them in the leader's pg_stat_replication -- which is why this is a second
+# probe rather than a reuse of the standby one. It reads the follower's own view for
+# two reasons: it still answers when the leader is unreachable, and a follower can
+# be receiving WAL while failing to apply it, which the leader's view calls
+# `streaming`. The subscription name is an opaque `follower_<hex>_<hex>` with no
+# hostname in it, so there is nothing to key on -- a follower has exactly its own
+# subscriptions.
+@test "follower replication is read from the follower's own subscriptions" {
+  BIN_ENV_SOURCE_ONLY=1 source bin/env
+
+  # Both hosts answering as the live pair really did, keyed on port so that the host
+  # is part of what is asserted. The leader's body is the interesting half:
+  # `subscriptions` comes back as a *sentence*, not an array. Reading it as an empty
+  # list would report `not replicating` for a cluster that is fine, and a filter that
+  # only counted a non-empty array would call the leader a replicating follower.
+  curl() {
+    case "$*" in
+      *localhost:450* )
+        cat <<'JSON'
+{
+  "ok": true,
+  "role": "follower",
+  "database": {
+    "ok": true,
+    "logical_replication_status": {
+      "subscriptions": [
+        {
+          "name": "follower_41f474_532e785c995b",
+          "enabled": true,
+          "received_lsn": "0/68C2D58",
+          "last_msg_send_time": "2026-09-23 01:02:05 +0000",
+          "last_msg_receipt_time": "2026-09-23 01:02:05 +0000",
+          "apply_error_count": 0,
+          "sync_error_count": 0,
+          "replication_sets": ["default", "full"]
+        }
+      ],
+      "initial_replication_in_progress": false
+    }
+  }
+}
+JSON
+        ;;
+      *localhost:443* )
+        cat <<'JSON'
+{
+  "ok": true,
+  "role": "master",
+  "database": {
+    "logical_replication_status": {
+      "subscriptions": "Subscriptions are only available on Conjur Followers.",
+      "initial_replication_in_progress": false
+    }
+  }
+}
+JSON
+        ;;
+      * ) return 7 ;;
+    esac
+  }
+
+  [ "$(_follower_replication_state)" = 'replicating' ]
+
+  # The same probe pointed at the leader, which is the mistake this guards against.
+  # Verified live as well: it reads `not a follower` against conjur-master-1.
+  CONJUR_FOLLOWER_PORT="$CONJUR_MASTER_PORT"
+
+  [ "$(_follower_replication_state)" = 'not a follower' ]
+}
+
+# The failure cases, each derived from the captured body above by changing only the
+# field the filter reads. A follower that is up, healthy and serving from a stale
+# snapshot answers `ok` on /health, so these are the rows that tell the difference.
+@test "a follower that is up but behind or disconnected fails its replication check" {
+  BIN_ENV_SOURCE_ONLY=1 source bin/env
+
+  follower_health_body() {
+    cat <<JSON
+{ "ok": true, "role": "follower", "database": { "logical_replication_status": {
+  "subscriptions": $1, "initial_replication_in_progress": ${2:-false} } } }
+JSON
+  }
+
+  # Configured as a follower, subscribed to nothing: what a follower brought up
+  # without `evoke configure follower` ever completing looks like.
+  curl() { follower_health_body '[]'; }
+  [ "$(_follower_replication_state)" = 'not replicating' ]
+
+  # Still copying the leader's database. Reported as its own state rather than as a
+  # failure of replication, because it is a stage every follower passes through.
+  curl() { follower_health_body '[{"enabled":true,"apply_error_count":0,"sync_error_count":0}]' true; }
+  [ "$(_follower_replication_state)" = 'initial sync' ]
+
+  # The subscription exists but is not running, which is what `evoke replication
+  # stop` leaves behind -- and the state in which the follower keeps serving the
+  # data it already has.
+  curl() { follower_health_body '[{"enabled":false,"apply_error_count":0,"sync_error_count":0}]'; }
+  [ "$(_follower_replication_state)" = 'disabled' ]
+
+  # Receiving changes and failing to apply them. This is the case the leader's own
+  # pg_stat_replication would call `streaming`.
+  curl() { follower_health_body '[{"enabled":true,"apply_error_count":3,"sync_error_count":0}]'; }
+  [ "$(_follower_replication_state)" = 'apply errors' ]
+
+  curl() { follower_health_body '[{"enabled":true,"apply_error_count":0,"sync_error_count":2}]'; }
+  [ "$(_follower_replication_state)" = 'sync errors' ]
+
+  # No replication block at all, which is what an older appliance answers. Distinct
+  # from every state above: the probe has no view, rather than a bad one.
+  curl() { echo '{"ok":true,"role":"follower","database":{"ok":true}}'; }
+  [ "$(_follower_replication_state)" = 'unparseable' ]
+}
+
 @test "sample data is verified by retrieving a secret, not by the fetch succeeding" {
   BIN_ENV_SOURCE_ONLY=1 source bin/env
 
@@ -1409,6 +1872,52 @@ JSON
   }
 
   [ "$(_sample_data_state)" = 'not retrievable' ]
+}
+
+# The check the ticket asks for is that the secret comes back *through the
+# follower*, and the trap is that bin/api will happily answer without going near
+# one. Its fetch_secrets always reads from the master URL, so --against-master only
+# changes where it authenticates: a follower check written that way passes against a
+# follower that was never provisioned. Pointing --leader-url at the follower load
+# balancer is what makes the read go through the follower, so that argument is the
+# thing under test here.
+@test "the sample secret is read through the follower, not through the leader" {
+  BIN_ENV_SOURCE_ONLY=1 source bin/env
+
+  bin/api() {
+    printf '%s\n' "$*" >> "$BATS_TEST_TMPDIR/api-args"
+    cat <<'JSON'
+{
+  "demo:variable:staging/my-app-1/postgres-database/password": "secret-p@ssword-staging-my-app-1",
+  "demo:variable:staging/my-app-1/postgres-database/username": "my-app-1"
+}
+JSON
+  }
+
+  [ "$(_follower_secret_state)" = 'retrievable' ]
+
+  run cat "$BATS_TEST_TMPDIR/api-args"
+  [[ "$output" == *'--leader-url https://conjur-follower.mycompany.local'* ]]
+  [[ "$output" == *'--fetch-secrets'* ]]
+  [[ "$output" != *'--against-master'* ]]
+}
+
+@test "a follower that answers the fetch with nothing is not retrievable" {
+  BIN_ENV_SOURCE_ONLY=1 source bin/env
+
+  # A follower whose own database is empty authenticates and answers, so the exit
+  # status says the read worked. The value is the only evidence that it did.
+  bin/api() {
+    echo '{}'
+  }
+
+  [ "$(_follower_secret_state)" = 'not retrievable' ]
+
+  bin/api() {
+    return 1
+  }
+
+  [ "$(_follower_secret_state)" = 'not retrievable' ]
 }
 
 #

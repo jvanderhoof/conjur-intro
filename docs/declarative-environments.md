@@ -8,9 +8,10 @@ scope. For how to actually use the thing, see
 single-leader provisioning, verification and fast tests — is in place, and so are the
 guard rails: preflight, the refusal to reconcile, `--recreate`, and the podman
 refusal. So are standbys (up to 4) and auto-failover, with the quorum requirement as a
-cross-field schema rule. Followers, the leader-hardening flags and the `conjur-env`
-skill are not. The schema refuses the topology `bin/env` cannot build rather than
-letting it provision something smaller.
+cross-field schema rule, and one follower with its proxy trust and its own health,
+replication and retrieval checks. The leader-hardening flags, more than one follower,
+and the `conjur-env` skill are not. The schema refuses the topology `bin/env` cannot
+build rather than letting it provision something smaller.
 **Date:** 2026-09-22
 **Scope:** Proof of concept. End-to-end first; robustness in later passes.
 
@@ -46,7 +47,7 @@ and is small enough to keep honest.
 | Path | Tracked? | Purpose |
 |---|---|---|
 | `environments/schema.json` | yes | The contract. `additionalProperties: false`, so an unsupported or typo'd key is a hard error rather than a silent no-op. Range and cross-field constraints live here, never in `bin/env`. |
-| `environments/examples/*.yml` | yes | Sanitized specs (single-node, HA-with-auto-failover, later multi-follower). Double as documentation and as test fixtures. |
+| `environments/examples/*.yml` | yes | Sanitized specs (single-node, HA-with-auto-failover, leader-and-follower, later multi-follower). Double as documentation and as test fixtures. |
 | `environments/*.yml` | **no — gitignored** | Real customer specs. |
 | `bin/env` | yes | The entrypoint. |
 | `artifacts/env-validator/` | yes | The pinned container that converts YAML to JSON and applies the schema. |
@@ -68,7 +69,7 @@ leader:
   master_key_encryption: true   # not in the schema yet
   custom_certificates: true     # not in the schema yet
   generate_dh: false            # not in the schema yet
-followers: 1             # eventually 0 or 1; only 0 validates today
+followers: 1             # 0-1, the compose topology's ceiling
 sample_data: true        # default; runs bin/api --load-sample-policy-and-values
 
 # events: []             # reserved seam, not implemented
@@ -88,14 +89,16 @@ ticket that wires them up.
 **A field's accepted *range* widens as `bin/env` learns to build it.** In pass 1
 `standbys` and `followers` were `maximum: 0` and `auto_failover` was
 `const: false`, so a spec asking for a cluster was rejected by the schema rather
-than by a conditional in `bin/env`. `standbys` is now `0-4` — the ceiling is the
-compose file's, which defines `conjur-master-1` through `conjur-master-5` — and
-`auto_failover` is a plain boolean. `followers` is still `maximum: 0`; it rises to
-1, then beyond, when it is wired up. Keeping the refusal in the schema is what
-makes "a spec that validates is a spec that can be provisioned" true, and what
-makes a hand-written spec fail exactly where a generated one does. The validator
-supplies the hint (*"followers are not provisioned yet"*) that a bare range error
-cannot.
+than by a conditional in `bin/env`. Every ceiling is now the compose topology's
+instead: `standbys` is `0-4`, because `docker-compose.yml` defines
+`conjur-master-1` through `conjur-master-5`; `followers` is `0-1`, because it
+defines a single `conjur-follower-1` and the follower load balancer is configured
+with one backend server; and `auto_failover` is a plain boolean. Keeping the
+refusal in the schema is what makes "a spec that validates is a spec that can be
+provisioned" true, and what makes a hand-written spec fail exactly where a generated
+one does. The validator supplies the hint a bare range error cannot — what the
+ceiling *is* the schema can say, but not where it comes from or what raising it
+would take.
 
 **Cross-field rules live there too.** Auto-failover is an etcd cluster and elects
 by majority, so a leader with one standby cannot fail over at all: losing the
@@ -139,7 +142,7 @@ pointer and abort before anything is provisioned.
 | `--plan` | yes | Prints the ordered command sequence without executing, preceded by the preflight checks it would run. |
 | Preflight | yes | The requested appliance tag resolves — local cache first, then the registry under a 30s ceiling; required host ports are free; no environment already exists. Fails in seconds rather than six minutes into a run. |
 | Provision | yes | Sequences existing `bin/dap` / `bin/api` flags in dependency order. |
-| Verify | yes | Probes `/health`, `/info`, replication and cluster state; prints a desired-vs-actual table; exits non-zero on mismatch. |
+| Verify | yes | Probes `/health` on the leader and on the follower, `/info` on the leader, standby and follower replication, cluster state, and a secret read through both the leader and the follower; prints a desired-vs-actual table; exits non-zero on mismatch. |
 | Re-run | yes | **No convergence.** If anything exists, refuse and direct the user to `--recreate`. |
 | `--recreate` | yes | Tears down and rebuilds, stating plainly that volumes (seeds, MKE key, audit data) are destroyed. |
 | Podman | yes | **Unsupported.** Refuses with a message pointing at `bin/podman-dap`. |
@@ -165,6 +168,32 @@ first, because the two probes each answer half of it — `/info` knows the name 
 who joined, the member list knows who joined but not which cluster they are in — and a
 row whose DESIRED column reads `production` verifies the name in a way that one
 reading `true` only implies.
+
+A follower gets three rows, and the split is the point. **Health** is read from the
+follower's own port rather than through its load balancer or from the leader: the
+leader answers `/health` on the same route with the same shape and answers it `ok`,
+so a probe pointed at the wrong port would report a healthy follower whether or not
+one exists. **Replication** is read from the follower's own pglogical subscriptions
+rather than from the leader's `pg_stat_replication`, which followers have no row in
+at all — logical replication is not physical replication with a different host. The
+follower's own view wins on two counts: it still answers when the leader is
+unreachable, and it distinguishes receiving changes from applying them, where a
+follower streaming WAL it cannot apply reads as `streaming` from the leader's side.
+There is nothing to key the subscription on and nothing to key it on either — the
+name is an opaque `follower_<hex>_<hex>` and a follower has exactly its own
+subscriptions. **Secret read** goes end to end through the follower load balancer,
+because it is the only row that authenticates, and because health and replication
+are both statements the follower makes about itself.
+
+Health and replication are separate rows because they fail separately, and the pair
+is what tells the states apart: `evoke seed follower` snapshots the leader's
+database, so a follower whose replication stopped right afterwards is up, calls
+itself healthy, and serves data that is quietly out of date. The same fact fixes the
+provisioning order — the follower goes in *before* the sample data, because a
+follower seeded afterwards would serve the sample secret out of its own snapshot and
+the retrieval row would pass on a follower that never replicated at all. It goes in
+*after* auto-failover enrolment, because `evoke configure follower` installs the
+failover rebaser that repoints it at a newly promoted leader.
 
 Podman is out because `bin/podman-dap` is a drifted fork of `bin/dap` — no
 `--standby-count` (it hardcodes 5 standbys), no MKE, no Keycloak, no k8s paths,
@@ -257,6 +286,24 @@ name versus the image tag after it, a secret fetch that succeeded with nothing i
 The load balancer's `Authorization missing` is in there too, as the shape of a
 request that succeeds and tells you nothing.
 
+The follower probes add a variant of the same trap, and it is worth naming because
+a captured payload alone does not catch it: the follower's answer and the leader's
+are *both* valid, so a probe pointed at the wrong host reports on the wrong appliance
+with nothing to show that it has. The test that pins each follower probe's host
+therefore stubs `curl` to answer by **port**, which makes the host part of what is
+asserted rather than an assumption — the leader's body is in the test, answering
+`ok`, while the follower's says otherwise. The further cases behind each probe (the
+ones walking the replication filter through `disabled`, `apply errors` and the rest)
+answer regardless of port, because what they pin is the filter's reading of a body,
+and the host is already pinned by the test above them.
+The replication filter gets the sharpest version of it for free: the leader answers
+that route with `"subscriptions": "Subscriptions are only available on Conjur
+Followers."`, a sentence where a follower has a list, so the real leader payload is
+the test for the type guard that stops a truthy string from reading as a healthy
+follower. `bin/api`'s arguments are asserted for the same reason — it reads secrets
+from whatever it is given as the leader URL, so a follower retrieval check written
+with `--against-master` would pass against an environment with no follower in it.
+
 All of them were written after the code they cover, which makes them worth a moment's
 suspicion: a test written green proves only that it agrees with today's
 implementation. Each was checked by breaking what it pins and confirming it went red.
@@ -272,14 +319,25 @@ spec→sequence translation testable, and it is what the skill shows before prov
 
 ### Pass 2 — first increment
 
-`followers: 2..N`. Requires new compose services, generated follower haproxy backend
-lines, and moving `files/haproxy/follower/haproxy.cfg` to the generated-and-gitignored
-side — the master equivalent is already handled that way.
+`followers: 2..N`. Pass 1 ships `followers: 0..1`, which sequences existing `bin/dap`
+flags the way everything else in it does. Going beyond one is a different kind of
+work: new compose services, generated follower haproxy backend lines, and moving
+`files/haproxy/follower/haproxy.cfg` to the generated-and-gitignored side — the master
+equivalent is already handled that way.
 
-This is deliberately *not* in pass 1. It is the only item in scope needing new compose
-services rather than sequencing existing flags, and separating it keeps the PoC's
-riskiest question (does the whole chain hold together?) apart from its fiddliest one
-(compose services, haproxy generation, the shared `follower-certs` volume).
+That is why the ceiling stops at one rather than at zero. One follower needs nothing
+the compose file does not already define, so it belongs with the rest of pass 1;
+the second is the first thing in scope that needs the compose file to change. Keeping
+them apart keeps the PoC's riskiest question (does the whole chain hold together?)
+apart from its fiddliest one (compose services, haproxy generation, the shared
+`follower-certs` volume).
+
+The verification rows are ready for it in shape but not in form: `follower health`,
+`follower replication` and `follower secret read` are single rows, and with more than
+one follower they become one row per follower — the way `standby N replication`
+already reads. `_probe` is already parameterised by port — `_leader_probe` and
+`_follower_probe` are both one-line delegations to it — so that is a change to
+`_verify` and to how a follower's port is derived, not to any of the filters.
 
 ---
 
@@ -344,6 +402,29 @@ back into a spec.
    `docs/environments.md` tells the operator to `git checkout` it. Worth fixing in
    `bin/dap` — generate that policy to a gitignored path — rather than documenting
    forever.
+5. **Proxy trust is provisioned but not verified.** `bin/env` runs
+   `bin/dap --trust-follower-proxy` and then asserts nothing about it, so a follower
+   whose trusted proxy is wrong passes every row. The three follower rows read
+   `/health` and a secret, and none of them changes with the trusted proxy list —
+   what would have to be probed is `evoke proxy list`, which is `docker compose exec`
+   rather than an HTTP route and so is a different shape of probe from every other
+   check here. Worth adding, and the reason it was not added in this pass is that the
+   step it would cover was itself broken until this one: `--trust-follower-proxy` ran
+   `evoke proxy add 12.16.23.15`, which is `conjur-master-5` rather than the follower
+   load balancer's `12.16.23.16`, so the command succeeded and trusted a host that
+   never forwards to the follower. Fixed here in `bin/dap`, which is a change outside
+   `bin/env`'s remit made because the acceptance criterion — a follower provisioned
+   and proxy-trusted in the same run, no manual follow-up — could not otherwise hold.
+   Environments built before the fix still carry the wrong address; `evoke proxy list`
+   on the follower shows it.
+6. **`bin/api --fetch-secrets` always reads from the leader URL.** `--against-master`
+   only changes where it *authenticates*; `fetch_secrets` curls the master URL either
+   way. So the only way to read through a follower is
+   `--leader-url https://conjur-follower.mycompany.local`, which is what the follower
+   retrieval check does, and the flag names are actively misleading about it. The
+   argument is asserted in `test/env.bats` precisely because the obvious spelling
+   passes against an environment with no follower in it. Worth renaming or splitting
+   in `artifacts/api-client/api-script`.
 
 ---
 

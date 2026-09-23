@@ -1076,8 +1076,14 @@ function _create_backup {
 }
 
 function _add_follower_proxy {
+  # The follower's own load balancer, which is what actually sits in front of it and
+  # sets the X-Forwarded-For this makes the follower believe. This was 12.16.23.15 --
+  # conjur-master-5 -- so the command succeeded and trusted a host that never
+  # forwards to the follower, leaving audit records and IP-restricted host identities
+  # seeing the load balancer's address instead of the client's. Both addresses are
+  # docker-compose.yml's.
   _run conjur-follower-1.mycompany.local \
-    "evoke proxy add 12.16.23.15"
+    "evoke proxy add 12.16.23.16"
 }
 
 function _trigger_master_failover_failover {

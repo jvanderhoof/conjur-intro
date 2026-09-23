@@ -35,10 +35,10 @@
       }
     },
     "followers": {
-      "description": "Number of followers to deploy behind the follower load balancer. Only 0 validates today, because bin/env does not provision followers yet. The ceiling rises to 1 when it does, and beyond that once multi-follower compose services exist.",
+      "description": "Number of followers to deploy behind the follower load balancer. The ceiling is the compose topology's again: docker-compose.yml defines a single conjur-follower-1, and the follower load balancer's haproxy.cfg names one backend server, so a second follower needs generated proxy config as well as a new compose service. More is refused here rather than provisioning one follower and reporting a mismatch for the rest.",
       "type": "integer",
       "minimum": 0,
-      "maximum": 0,
+      "maximum": 1,
       "default": 0
     },
     "sample_data": {
