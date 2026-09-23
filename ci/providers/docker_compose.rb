@@ -40,6 +40,7 @@ module CI
         system('docker compose exec conjur-follower-1.mycompany.local bash -c "evoke unpack seed /opt/cyberark/dap/seeds/follower-seed.tar && evoke configure follower"')
 
         # Start Load Balancer
+        system('bash -c "source bin/utils.sh && _set_follower_proxy_config"')
         system('docker compose up -d --no-deps conjur-follower.mycompany.local')
       end
 

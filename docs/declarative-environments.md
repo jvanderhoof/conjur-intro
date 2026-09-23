@@ -359,15 +359,17 @@ spec→sequence translation testable, and it is what the skill shows before prov
 
 `followers: 2..N`. Pass 1 ships `followers: 0..1`, which sequences existing `bin/dap`
 flags the way everything else in it does. Going beyond one is a different kind of
-work: new compose services, generated follower haproxy backend lines, and moving
-`files/haproxy/follower/haproxy.cfg` to the generated-and-gitignored side — the master
-equivalent is already handled that way.
+work: new compose services, and a follower haproxy backend line per follower.
+`files/haproxy/follower/haproxy.cfg` is already generated at provisioning time and
+gitignored, as the master equivalent is (`_set_follower_proxy_config` in
+`bin/utils.sh`, shared with `bin/podman-dap`), so a second follower changes how
+many backends it emits rather than introducing generation.
 
 That is why the ceiling stops at one rather than at zero. One follower needs nothing
 the compose file does not already define, so it belongs with the rest of pass 1;
 the second is the first thing in scope that needs the compose file to change. Keeping
 them apart keeps the PoC's riskiest question (does the whole chain hold together?)
-apart from its fiddliest one (compose services, haproxy generation, the shared
+apart from its fiddliest one (compose services, per-follower backends, the shared
 `follower-certs` volume).
 
 The verification rows are ready for it in shape but not in form: `follower health`,

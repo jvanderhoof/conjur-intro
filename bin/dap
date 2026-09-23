@@ -279,6 +279,7 @@ function _start_master {
 
 function _start_l7_load_balancer {
   if [[ $DRY_RUN = false ]]; then
+    _set_follower_proxy_config
     docker compose up -d --no-deps conjur-follower.mycompany.local
   fi
 }
@@ -921,6 +922,7 @@ function _stop {
   _command rm -rf system/logs
   _command rm -rf system/haproxy/certs
   _command rm files/haproxy/master/haproxy.cfg || true
+  _command rm files/haproxy/follower/haproxy.cfg || true
   _command rm kubeconfig || true
   echo "stopped"
   exit

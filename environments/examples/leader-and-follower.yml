@@ -20,8 +20,9 @@
 # retrieve-through-the-follower check means what it says.
 #
 # One follower is the ceiling. docker-compose.yml defines a single
-# conjur-follower-1 and the follower load balancer is configured with one backend
-# server, so a second would need new compose services and generated proxy config.
+# conjur-follower-1 and the follower load balancer's generated config has one
+# backend server, so a second would need new compose services and a backend for
+# each.
 #
 # This tier takes four more host ports: 80, 449 and 7001 for the load balancer, and
 # 450 for the follower appliance itself. Preflight checks them all before pulling

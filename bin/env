@@ -43,7 +43,7 @@ FOLLOWER_URL='https://conjur-follower.mycompany.local'
 
 # Holds the YAML parser and the JSON Schema validator so that neither is a host
 # dependency. Bump the tag when artifacts/env-validator changes.
-VALIDATOR_IMAGE='conjur-intro/env-validator:3'
+VALIDATOR_IMAGE='conjur-intro/env-validator:4'
 SCHEMA='environments/schema.json'
 
 # The appliance image docker-compose.yml starts. Preflight resolves the
@@ -104,9 +104,9 @@ must never end up in a tracked file.
 Up to 4 standbys can be provisioned, optionally enrolled in an auto-failover
 cluster -- which needs at least 2 of them to hold a quorum. One follower can be
 provisioned alongside them; asking for a follower also configures its proxy trust,
-so there is no manual follow-up step. A second follower would need new compose
-services and generated proxy config, so the schema rejects it rather than letting
-bin/env quietly build something smaller.
+so there is no manual follow-up step. A second follower would need a new compose
+service and its own backend in the follower proxy config, so the schema rejects
+it rather than letting bin/env quietly build something smaller.
 
 The leader can be hardened with master key encryption, custom certificates and
 generated DH parameters, each an independent boolean that defaults to off. All

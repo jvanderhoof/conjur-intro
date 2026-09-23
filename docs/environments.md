@@ -244,12 +244,12 @@ the time the follower is configured against it.
 
 **The ceiling is one follower**, and it is the compose topology's again —
 `docker-compose.yml` defines a single `conjur-follower-1`, and the follower load
-balancer is configured with one backend server, so a second needs generated proxy
-config as well as a new compose service:
+balancer's generated config has one backend server, so a second needs a new compose
+service as well as its own backend in that config:
 
 ```
 bin/env: spec error at /followers: 2 is greater than the maximum of 1
-bin/env:   hint: docker-compose.yml defines a single conjur-follower-1, and the follower load balancer is configured with one backend server, so more followers would need new compose services and generated proxy config
+bin/env:   hint: docker-compose.yml defines a single conjur-follower-1, and the follower load balancer's generated config has one backend server, so more followers would need new compose services and a backend for each
 bin/env: the spec was not accepted, so nothing was provisioned.
 ```
 
@@ -674,8 +674,8 @@ than you asked for: at most 4 standbys
 Also not supported, by design or by not-yet:
 
 - **More than one follower.** One `conjur-follower-1` in `docker-compose.yml`, and
-  one backend server in the follower load balancer's config. A second needs both a
-  new compose service and proxy config generated per follower.
+  one backend server in the follower load balancer's generated config. A second
+  needs both a new compose service and a backend of its own in that config.
 - **Transitions.** `events:` is a reserved key, not a feature. Upgrades,
   promotions and triggered failovers are run by hand with `bin/dap`.
 - **Convergence.** There is no reconcile, by design: `bin/env` builds from clean

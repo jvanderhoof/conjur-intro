@@ -21,6 +21,7 @@ tmp/**
 **/backup/*
 
 files/haproxy/master/haproxy.cfg
+files/haproxy/follower/haproxy.cfg
 
 # Generated Certificates
 bin/build_ca_certificate/cyberark_root.crt

@@ -81,3 +81,83 @@ function retry_5_times() {
       echo "$result"
     fi
 }
+
+# The follower load balancer's HAProxy config. Generated at provisioning time,
+# as the leader's is, and gitignored. Here rather than in bin/dap because
+# bin/podman-dap mounts the same directory.
+function _set_follower_proxy_config {
+  local dir="${1:-files/haproxy/follower}"
+
+  mkdir -p "$dir"
+  _follower_proxy_config > "$dir/haproxy.cfg"
+}
+
+function _follower_proxy_config {
+  cat << EOF
+global
+  daemon
+  maxconn 256
+  log-send-hostname
+
+resolvers docker
+  nameserver dns1 127.0.0.11:53
+  resolve_retries 3
+  timeout retry 1s
+  hold valid 30s
+  hold other 30s
+  hold refused 30s
+  hold nx 30s
+  hold timeout 30s
+
+defaults
+  mode http
+  option forwardfor
+  timeout connect 50000ms
+  timeout client  50000ms
+  timeout server  50000ms
+
+#
+# Peform SSL Pass-Through to proxy HTTPS requests to DAP
+#
+
+frontend www
+  bind *:80
+  bind *:443 ssl crt /etc/ssl/certs/conjur-follower.mycompany.local.pem
+  default_backend www-backend
+
+#
+# Performs Layer 4 proxy
+# Uses DAP's HTTP health endpoint to determine master
+#
+
+backend www-backend
+  balance roundrobin
+  option httpchk GET /health
+$(_follower_backend_www_lines)
+
+#
+# Enables HAProxy's UI for debugging
+#
+listen stats
+  mode http
+  bind *:7000
+  stats enable
+  stats uri /
+EOF
+}
+
+function _follower_backend_www_lines {
+  declare -a follower_servers
+
+  # docker-compose.yml defines a single follower, conjur-follower-1
+  local follower_count=1
+
+  # Followers are resolved through docker's DNS at runtime (init-addr none), so
+  # the load balancer can start before they are resolvable
+  for ((i=1; i<=follower_count; i++))
+  do
+    follower_servers+=("  server conjur-follower-$i conjur-follower-$i.mycompany.local:443 check port 443 check port 443 check-ssl ca-file /etc/ssl/certs/ca.pem ssl ca-file /etc/ssl/certs/ca.pem resolvers docker init-addr none")
+  done
+
+  printf '%s' "$(IFS=$'\n' ; echo "${follower_servers[*]}")"
+}

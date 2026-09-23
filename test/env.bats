@@ -14,7 +14,7 @@ setup_file() {
 
   # Build the validator up front so the first test is not timed with a docker
   # build in it.
-  docker build --quiet --tag conjur-intro/env-validator:3 artifacts/env-validator > /dev/null
+  docker build --quiet --tag conjur-intro/env-validator:4 artifacts/env-validator > /dev/null
 }
 
 setup() {
@@ -780,8 +780,8 @@ bin/api --load-sample-policy-and-values' ]
 ## The follower tier -- how far the schema lets a spec go
 #
 # Same mechanism again, one tier down. docker-compose.yml defines a single
-# conjur-follower-1, and the follower load balancer's haproxy.cfg names one
-# backend, so a second follower needs generated config as well as a new compose
+# conjur-follower-1, and the follower load balancer's generated haproxy.cfg has
+# one backend, so a second follower needs its own backend as well as a new compose
 # service. Two is refused here rather than provisioning one follower and
 # reporting a mismatch for the other.
 
@@ -803,6 +803,64 @@ bin/api --load-sample-policy-and-values' ]
   run bin/env --plan "$SPEC"
 
   [ "$status" -eq 0 ]
+}
+
+#
+## The follower load balancer's config
+#
+# Generated at provisioning time, the way the leader's is, so that a second
+# follower only changes how many backends are emitted. bin/dap and
+# bin/podman-dap both mount it, so the generator lives in bin/utils.sh.
+
+# The server lines of the follower load balancer's www-backend.
+follower_backend_servers() {
+  source bin/utils.sh
+  _follower_proxy_config | awk '/^backend www-backend$/{ found = 1; next } found && /^#/{ exit } found' \
+    | grep '^  server '
+}
+
+@test "the follower load balancer's config has exactly one backend, conjur-follower-1" {
+  run follower_backend_servers
+
+  [ "$status" -eq 0 ]
+  [ "${#lines[@]}" -eq 1 ]
+  [[ "${lines[0]}" == '  server conjur-follower-1 conjur-follower-1.mycompany.local:443 '* ]]
+}
+
+@test "the follower backend is health-checked and verified against the leader's CA" {
+  run follower_backend_servers
+
+  [[ "${lines[0]}" == *' check port 443 '* ]]
+  [[ "${lines[0]}" == *' check-ssl ca-file /etc/ssl/certs/ca.pem '* ]]
+  [[ "${lines[0]}" == *' ssl ca-file /etc/ssl/certs/ca.pem '* ]]
+}
+
+# The load balancer starts before the follower is necessarily resolvable, so
+# the backend is resolved through docker's DNS at runtime rather than at start.
+@test "the follower backend is resolved through docker's DNS after the load balancer starts" {
+  source bin/utils.sh
+  run _follower_proxy_config
+
+  [[ "$output" == *$'resolvers docker\n  nameserver dns1 127.0.0.11:53'* ]]
+
+  run follower_backend_servers
+  [[ "${lines[0]}" == *' resolvers docker init-addr none' ]]
+}
+
+@test "the follower load balancer terminates TLS with the follower's certificate" {
+  source bin/utils.sh
+  run _follower_proxy_config
+
+  [[ "$output" == *'  bind *:443 ssl crt /etc/ssl/certs/conjur-follower.mycompany.local.pem'* ]]
+}
+
+@test "writing the follower load balancer's config creates its directory" {
+  source bin/utils.sh
+  dir="$BATS_TEST_TMPDIR/haproxy/follower"
+
+  _set_follower_proxy_config "$dir"
+
+  [ "$(cat "$dir/haproxy.cfg")" = "$(_follower_proxy_config)" ]
 }
 
 #

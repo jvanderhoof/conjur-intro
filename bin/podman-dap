@@ -1,4 +1,7 @@
 #!/bin/bash -e
+
+source ./bin/utils.sh
+
 _admin_password="MySecretP@ss1"
 
 function _print_help {
@@ -102,6 +105,7 @@ function _start_master {
 
 function _start_l7_load_balancer {
   if [[ $DRY_RUN = false ]]; then
+      _set_follower_proxy_config
       podman run --name conjur-follower.mycompany.local \
     -d --privileged --restart=unless-stopped \
     --security-opt seccomp=unconfined \
@@ -259,6 +263,7 @@ function _stop {
   _command rm -rf system/backup
   _command rm -rf system/logs
   _command rm files/haproxy/master/haproxy.cfg || true
+  _command rm files/haproxy/follower/haproxy.cfg || true
   echo "stopped"
   exit
 }
