@@ -332,10 +332,18 @@ back into a spec.
    `ci/providers/docker_compose.rb` already encodes, which itself duplicates
    `bin/dap`. The PoC knowingly adds a third copy. Recording it here so it is known
    debt rather than a later discovery. Consolidation is its own piece of work.
-3. **The cucumber suite is not in CI.** `Jenkinsfile` runs only
-   `bin/upgrade-test FROM TO`. Wiring `ci/bin/end-to-end-tests` in is a separate
-   effort, and until it happens there is no automated integration coverage of
-   provisioning at all.
+3. **Nothing here is in CI.** `Jenkinsfile` runs only `bin/upgrade-test FROM TO`. It
+   invokes neither `ci/bin/end-to-end-tests` nor `bin/env-test`, so there is no
+   automated integration coverage of provisioning at all, and the fast suite — which
+   was built to be CI-able and needs nothing but a docker daemon — runs only when
+   someone runs it. Wiring both in is a separate effort.
+4. **`bin/dap --enable-auto-failover` dirties a tracked file.** It rewrites
+   `policy/cluster.yml` to match the cluster it is building, so any auto-failover spec
+   leaves `git status` modified. That breaks the "never edit a tracked file" rule in
+   the decision log below, but it is `bin/dap`'s behaviour and not `bin/env`'s to fix;
+   `docs/environments.md` tells the operator to `git checkout` it. Worth fixing in
+   `bin/dap` — generate that policy to a gitignored path — rather than documenting
+   forever.
 
 ---
 

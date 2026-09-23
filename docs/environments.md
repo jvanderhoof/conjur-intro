@@ -486,8 +486,18 @@ the verification table over anything in the middle.
 leader is not streaming to it. `bin/dap --standby-count N --provision-standbys`
 seeds standbys from the leader, so this usually means the seed or
 `evoke replication sync start` did not complete for that node. The leader's own
-view is the authority: `curl -sk https://localhost:444/health | jq
-'.database.replication_status.pg_stat_replication'`.
+view is the authority, and this is the exact read behind the row:
+
+```sh
+curl -sk https://localhost:443/health \
+  | jq '.database.replication_status.pg_stat_replication'
+```
+
+Match the standby on `usename` — that is the replication role its seed created, so
+it carries the hostname. `application_name` is an opaque `standby_<hex>_<hex>`.
+Port 443 is the leader load balancer (`CONJUR_MASTER_PORT`), which is what `bin/env`
+probes; going direct to 444 asks conjur-master-1 specifically, which is a different
+question after a failover.
 
 **`cluster member N … missing`** — the node is not in etcd's member list even
 though the leader reports a cluster. `docker compose exec
@@ -511,4 +521,4 @@ around.
 | `environments/schema.json` | The contract. |
 | `environments/examples/` | Sanitized example specs. |
 | `artifacts/env-validator/` | Pinned container that converts YAML to JSON and applies the schema, in one pass. |
-| `test/env.bats` | Plan-output, validation and verification-failure tests. |
+| `test/env.bats` | Plan output, validation failures, the guard rails, and each verification probe against a captured appliance payload. |
