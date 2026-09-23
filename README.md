@@ -186,7 +186,8 @@ version: "5.0-stable"
 ```
 
 Everything else takes a documented default: one leader, no standbys, no
-follower, no auto-failover, and the sample policy and secrets loaded. Quote the
+follower, no auto-failover, no leader hardening (master key encryption, custom
+certificates, generated DH parameters), and the sample policy and secrets loaded. Quote the
 version — unquoted `13.10` is the YAML number `13.1`.
 
 The schema is the contract, so an unknown or misspelled key is a hard error

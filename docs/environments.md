@@ -22,7 +22,7 @@ when you are exploring, or when you need something `bin/env` cannot build yet.
 
 ## Quick start
 
-### 1. Run the tests (seconds, no appliance)
+### 1. Run the tests (about a minute, no appliance)
 
 ```sh
 bin/env-test
@@ -32,7 +32,7 @@ This starts no Conjur appliance and never contacts `registry.tld`, so it is the
 cheapest way to confirm the tool works at all. One test by name:
 
 ```sh
-bin/env-test test/env.bats --filter 'refused by the schema'
+bin/env-test test/env.bats --filter 'auto-failover with one standby is refused'
 ```
 
 ### 2. See what it would do (no side effects)
@@ -184,7 +184,7 @@ the standby count is passed to `--provision-master` as well:
 Commands:
   1. bin/dap --version 5.0-stable --standby-count 2 --provision-master
   2. bin/dap --wait-for-master
-  3. bin/dap --standby-count 2 --provision-standbys
+  3. bin/dap --version 5.0-stable --standby-count 2 --provision-standbys
   4. bin/dap --standby-count 2 --enable-auto-failover
   5. bin/api --load-sample-policy-and-values
 ```
@@ -552,6 +552,9 @@ Verification
   leader health          ok               ok               ok
   leader /info           reported         reported         ok
   leader image tag       5.0-stable       5.0-stable       ok
+  master key encryption  not encrypted    not encrypted    ok
+  leader certificate     appliance CA     appliance CA     ok
+  dh parameters          pre-generated    pre-generated    ok
   standbys running       2                2                ok
   standby 2 replication  streaming        streaming        ok
   standby 3 replication  streaming        streaming        ok

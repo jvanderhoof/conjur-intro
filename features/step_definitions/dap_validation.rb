@@ -2,7 +2,7 @@
 
 # Validation tasks
 Given('I load a variable and value') do
-  system('bin/api --load-policy-and-values')
+  system('bin/api --load-sample-policy-and-values')
 end
 
 When('I request the variable value through the API') do

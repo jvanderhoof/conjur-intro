@@ -9,9 +9,9 @@ single-leader provisioning, verification and fast tests — is in place, and so 
 guard rails: preflight, the refusal to reconcile, `--recreate`, and the podman
 refusal. So are standbys (up to 4) and auto-failover, with the quorum requirement as a
 cross-field schema rule. So are up to 3 followers behind a generated load balancer,
-with their proxy trust, health and replication checked per follower, a secret read
+with their health and replication checked per follower, a secret read
 through the load balancer, and a check that the load balancer routes to every one of
-them — pass 2's first increment, which has landed. So are the three
+them — pass 2, which has landed. So are the three
 leader-hardening flags — master key encryption, custom certificates and generated DH
 parameters — each verified off the leader itself. So is the `conjur-env` skill,
 measured by an eval against a no-skill baseline rather than by tests. The schema
@@ -58,6 +58,8 @@ and is small enough to keep honest.
 | `artifacts/env-validator/` | yes | The pinned container that converts YAML to JSON and applies the schema. |
 | `test/env.bats` | yes | Plan-output and validation tests. |
 | `bin/env-test` | yes | Runs `test/env.bats` in a container, so bats is not a host dependency. |
+| `artifacts/bats/Dockerfile` | yes | The image `bin/env-test` runs the suite in. |
+| `.claude/skills/conjur-env/` | yes | The `conjur-env` skill — customer prose to a validated spec — and its evals. |
 
 `environments/` is gitignored because **this repo is mirrored to the public
 `conjurdemos` GitHub org** (see `Jenkinsfile`). Customer appliance hostnames, customer
@@ -249,7 +251,7 @@ non-interactive use and that design.
 ### Testing
 
 `test/env.bats` asserts the `--plan` output for every tracked example spec, plus the
-validation failures. Run it with `bin/env-test`. It finishes in seconds, starts
+validation failures. Run it with `bin/env-test`. It finishes in about a minute, starts
 no appliance containers and never touches `registry.tld`, so it can genuinely run in
 CI — unlike the existing cucumber suite, which `ci/bin/end-to-end-tests` can drive
 but which the `Jenkinsfile` never invokes. Wiring it into the `Jenkinsfile` is
@@ -365,7 +367,7 @@ reports for a dangling symlink rather than captured from a restarted MKE leader.
 `--plan` therefore serves two needs at once: it is what makes the
 spec→sequence translation testable, and it is what the skill shows before provisioning.
 
-### Pass 2 — first increment (landed)
+### Pass 2 (landed)
 
 `followers: 0..3`. Pass 1 shipped `followers: 0..1`, which sequenced existing
 `bin/dap` flags the way everything else in it does; going beyond one was a different
@@ -503,8 +505,9 @@ back into a spec.
    forever.
 5. **Proxy trust is provisioned but not verified.** `bin/env` runs
    `bin/dap --trust-follower-proxy` and then asserts nothing about it, so a follower
-   whose trusted proxy is wrong passes every row. The three follower rows read
-   `/health` and a secret, and none of them changes with the trusted proxy list —
+   whose trusted proxy is wrong passes every row. The follower rows read `/health`,
+   a secret and the load balancer's stats, and none of them changes with the
+   trusted proxy list —
    what would have to be probed is `evoke proxy list`, which is `docker compose exec`
    rather than an HTTP route and so is a different shape of probe from every other
    check here. Worth adding, and the reason it was not added in this pass is that the
@@ -535,7 +538,7 @@ back into a spec.
    without the appliance feature it describes working — which is why
    `environments/examples/hardened.yml` leaves `generate_dh` off. It is an appliance
    bug, and the fix belongs in the appliance's script.
-8. **Two `bin/dap` fixes the hardening criteria needed.** Both are outside `bin/env`'s
+8. **Three `bin/dap` fixes the hardening criteria needed.** All are outside `bin/env`'s
    remit, and made because a hardened spec could not otherwise provision in one run.
    - *The leader load balancer's CA went stale on certificate import.* Once standbys
      exist, HAProxy health-checks the leader with `check-ssl` against a snapshot of

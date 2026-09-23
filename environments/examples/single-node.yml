@@ -15,6 +15,9 @@ version: "5.0-stable"
 leader:
   standbys: 0
   auto_failover: false
+  master_key_encryption: false
+  custom_certificates: false
+  generate_dh: false
 
 followers: 0
 

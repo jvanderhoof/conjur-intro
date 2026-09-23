@@ -13,7 +13,7 @@ setup_file() {
   cd "$BATS_TEST_DIRNAME/.."
 
   # Build the validator up front so the first test is not timed with a docker
-  # build in it.
+  # build in it. The tag is bin/env's VALIDATOR_IMAGE and has to move with it.
   docker build --quiet --tag conjur-intro/env-validator:5 artifacts/env-validator > /dev/null
 }
 

@@ -113,7 +113,7 @@ Up to 4 standbys can be provisioned, optionally enrolled in an auto-failover
 cluster -- which needs at least 2 of them to hold a quorum. Up to 3 followers can
 be provisioned alongside them, behind a load balancer generated with a backend per
 follower; asking for followers also configures their proxy trust, so there is no
-manual follow-up step. A fourth would need a new compose service, so the schema
+manual follow-up step. A fourth follower would need a new compose service, so the schema
 rejects it rather than letting bin/env quietly build something smaller.
 
 The leader can be hardened with master key encryption, custom certificates and
