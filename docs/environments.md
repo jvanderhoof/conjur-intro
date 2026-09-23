@@ -825,6 +825,24 @@ actually holds.
 the schema is meant to make it impossible. Worth reporting rather than working
 around.
 
+## From a customer description: the `conjur-env` skill
+
+In Claude Code, from this repo, paste a customer's description of their environment
+(or give the path to a local file holding it) and ask for a local repro. The
+`conjur-env` skill works through these steps:
+
+1. It maps the description onto the spec's fields.
+2. It asks about every field the description leaves unstated.
+3. It writes a spec into `environments/` and validates it with `bin/env --plan`.
+4. It stops at a single gate. The gate shows the spec, everything the customer
+   described that the spec cannot express (to set up by hand), the plan, and what
+   `--recreate` would destroy if an environment already exists.
+5. On a clear yes, it runs `bin/env` and reports the verification table.
+
+The skill adds no provisioning logic of its own. Everything it builds, it builds
+through `bin/env`. The skill is at `.claude/skills/conjur-env/`, and its evals are at
+`.claude/skills/conjur-env/evals/`.
+
 ## Files
 
 | Path | Purpose |
@@ -835,3 +853,4 @@ around.
 | `environments/examples/` | Sanitized example specs. |
 | `artifacts/env-validator/` | Pinned container that converts YAML to JSON and applies the schema, in one pass. |
 | `test/env.bats` | Plan output, validation failures, the guard rails, and each verification probe against a captured appliance payload. |
+| `.claude/skills/conjur-env/` | The skill that turns a customer's description into a spec, with its vendored vocabulary reference and its evals. |

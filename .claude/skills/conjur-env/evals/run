@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+
+# Runs the conjur-env eval suite: each case with the skill and without it, so the
+# score that matters is the delta between the two arms. See README.md.
+#
+# Extra arguments go to `claude plugin eval`, e.g. `--case complete --runs 1`.
+#
+# The models are pinned so scores are comparable between runs. The defaults are
+# Bedrock inference profile ids; override them for another provider:
+#
+#   EVAL_AGENT_MODEL=claude-sonnet-5 EVAL_JUDGE_MODEL=claude-sonnet-5 ./run
+#
+# EVAL_MAX_COST_USD (default 20) stops the suite once it has spent that much.
+
+set -euo pipefail
+
+skill_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+exec claude plugin eval "$skill_dir" \
+  --model "${EVAL_AGENT_MODEL:-us.anthropic.claude-sonnet-5}" \
+  --judge-model "${EVAL_JUDGE_MODEL:-us.anthropic.claude-sonnet-5}" \
+  --scaffold \
+  --trust-plugin \
+  --no-publish \
+  --allow-tools Write \
+  --max-cost-usd "${EVAL_MAX_COST_USD:-20}" \
+  "$@"

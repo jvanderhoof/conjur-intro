@@ -59,3 +59,7 @@ key.txt
 # sanitized examples under environments/examples/ are tracked.
 environments/*.yml
 environments/*.yaml
+
+# claude plugin eval output for the conjur-env skill: transcripts and reports of
+# individual runs, not part of the suite.
+.claude/skills/conjur-env/evals/results/

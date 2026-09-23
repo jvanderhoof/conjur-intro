@@ -11,7 +11,8 @@ refusal. So are standbys (up to 4) and auto-failover, with the quorum requiremen
 cross-field schema rule, and one follower with its proxy trust and its own health,
 replication and retrieval checks. So are the three leader-hardening flags — master
 key encryption, custom certificates and generated DH parameters — each verified off
-the leader itself. More than one follower, and the `conjur-env` skill, are not. The
+the leader itself. So is the `conjur-env` skill, measured by an eval against a
+no-skill baseline rather than by tests. More than one follower is not. The
 schema refuses the topology `bin/env` cannot build rather than letting it provision
 something smaller.
 **Date:** 2026-09-23
@@ -404,6 +405,33 @@ a non-`demo` account, a specific admin password, custom hostnames, a described u
 schema's `additionalProperties: false` means an invented key fails loudly rather than
 passing quietly.
 
+**Every field is written out.** The skill asks about every schema property the
+description leaves unstated, and writes the answer into the spec even when it equals
+the default. So a skill-written spec never depends on the schema's defaults, and
+changing a default cannot change what an existing generated spec builds. The skill
+reads its constraints from `environments/schema.json` at run time. Its vendored
+`reference/vocabulary.md` holds translation only: what customers call each field,
+and what they describe that no field expresses. That way a new field or a widened
+range needs no edit to the skill's prose to be enforced.
+
+**A topology larger than the schema accepts is capped and named.** When a customer
+has three followers and the schema accepts one, the spec says one, and the gap
+list says two more were asked for. Capping is the only choice that still validates.
+Naming the shortfall at the gate keeps it from being a silent approximation.
+
+**Testing is an eval, not a test suite.** The skill's output is a model's
+translation of prose, so an exact-output test would either be fragile or assert
+nothing. `.claude/skills/conjur-env/evals/` runs three invented escalations through
+`claude plugin eval`, each once with the skill and once without it, and reports the
+delta. The cases are a description that states everything, one that leaves most
+things unstated (the skill must ask, and must not write a spec), and one full of
+gaps. The baseline arm gets the same copy of the repo, so the comparison is against
+an agent that could read the schema and docs itself. Most graders read one field
+value out of the written spec with a line-anchored regex. Two yes/no judges check
+that the right questions were asked and the right gaps named. The evals cost money
+per run and are not wired into `bin/env-test`. What they do not reach — validation,
+the plan in the gate, provisioning — is listed in the evals' README.
+
 ---
 
 ## Non-goals for the PoC
@@ -423,6 +451,10 @@ back into a spec.
    hand-written spec is usable, but the skill never relies on them — it asks instead,
    so every spec it writes is complete. These two facts must stay consistent as fields
    are added, or a hand-written spec and a skill-written one will behave differently.
+   The skill holds up its half by walking every property in the schema and writing
+   every field. The eval's `every-field` grader checks that it did, but only for the
+   fields it names. Nothing enforces keeping the eval current: a new field needs a
+   grader in the `complete` case, or the skill can get it wrong unnoticed.
 2. **A third copy of ordering knowledge.** `bin/env` duplicates sequencing that
    `ci/providers/docker_compose.rb` already encodes, which itself duplicates
    `bin/dap`. The PoC knowingly adds a third copy. Recording it here so it is known
@@ -524,5 +556,8 @@ back into a spec.
 | KB access | Vendored reference | No path dependency on a single machine's clone. |
 | Skill gate | One gate: spec, gaps, plan, destruction warning | Folds the destructive confirm into the same decision point. |
 | Unstated dimensions | Ask about every one | A repro is worth the extra turns; there are only a handful of fields. |
+| Skill-written specs | Every field explicit, never a default | A generated spec's behaviour cannot shift when a schema default does. |
+| Over-ceiling topology | Cap at the schema's maximum, name the rest as a gap | The only choice that validates; naming it keeps it from being a silent approximation. |
+| Skill testing | `claude plugin eval` with a no-skill baseline, not bats | Prose translation has no exact output to assert; the delta is what shows the skill earns its place. |
 | Hardening verification | Read the leader's key files, presented chain and DH file | Each option can "succeed" while leaving the leader as it was; a silent fallback has to fail a row. |
 | Appliance DH bug | Surfaced, not worked around | Generating the file ourselves would make the row pass without the feature it describes. |

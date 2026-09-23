@@ -229,6 +229,11 @@ audit history. Podman is refused too, pointing at `bin/podman-dap`.
 Run the fast tests with `bin/env-test`; they start no appliance containers and
 need no `registry.tld` access.
 
+In Claude Code, the `conjur-env` skill (`.claude/skills/conjur-env/`) writes the
+spec for you from a customer's description of their environment. It asks about
+anything the description leaves out and names what the spec cannot express. It
+then shows one confirmation before running `bin/env`.
+
 - **[docs/environments.md](docs/environments.md)** — usage: writing a spec, the
   field reference, reading the verification table, troubleshooting.
 - **[docs/declarative-environments.md](docs/declarative-environments.md)** —
